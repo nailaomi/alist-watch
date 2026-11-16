@@ -1,7 +1,7 @@
 services:
   alist-watch:
     build: .
-    image: alist-watch:1.0
+    image: alist-watch:1.1
     container_name: alist-watch
     restart: unless-stopped
     ports:
@@ -21,3 +21,6 @@ services:
       #   - /volume1/docker/alist/data:/alist/data:ro
       # 如果 alist 也跑在 docker 里，可以直接用它的命名卷
       - /path/to/alist/data:/alist/data:ro
+      # 可选：只读挂载 docker 容器日志，用来算「文件级真实同步成功率」
+      # 不挂也能用，只是这一项改用 Emby 入库判断。注意：不要挂 docker.sock
+      # - /var/lib/docker/containers:/dockerlogs:ro

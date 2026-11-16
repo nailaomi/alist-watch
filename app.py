@@ -24,7 +24,7 @@ import urllib.error
 import urllib.request
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import parse_qs
+from urllib.parse import parse_qs, quote, urlparse
 
 import icon
 
@@ -47,6 +47,9 @@ DEFAULT_CONF = {
              "title_bad": "⛔ {bad} 需要处理",
              "level_ok": "active",
              "level_bad": "timeSensitive", "with_hint": True},
+    # 夜间静音窗口：凌晨出事也修不了，先别响铃，进通知中心早上再看。
+    # 默认 00:00–06:00；start==end 表示关闭。跨零点窗口也支持（如 23-7）。
+    "quiet_hours": {"start": 0, "end": 6},
     # 每天在这些时刻巡检并推送（早/中/晚）。某个格子留空 = 那一次不发。
     "schedule": {"times": ["08:30", "12:30", "19:30"]},
     # 实测鉴权（fs/list 真打上游）的频率控制——防封控
@@ -56,7 +59,10 @@ DEFAULT_CONF = {
     # 填 healthchecks.io 的 ping 地址或 Uptime Kuma 的 Push Monitor 地址
     "heartbeat": {"url": ""},
     "notify_when_ok": True,
-    "notify": {"policy": "always", "fail_threshold": 1, "repeat_bad": True},
+    # policy=daily：全绿一天只推一条，落在当天第一轮（默认早上 08:30），
+    #                正文带「昨日 N 轮」回顾；后面两轮全绿静默。
+    # policy=always：每轮都推（吵）；异常与恢复不受 policy 影响，永远立刻推。
+    "notify": {"policy": "daily", "fail_threshold": 1, "repeat_bad": True},
     "public_base": "",
     "ui_password": "changeme",
     "disabled": [],
@@ -64,6 +70,14 @@ DEFAULT_CONF = {
     # key 在 Emby 后台「设置 → 高级 → API 密钥」生成。
     # stale_h 是断更阈值：最近一条入库超过这么多小时，就认为每日同步出了问题。
     "emby": {"base": "", "key": "", "stale_h": 36},
+    # 小雅同步（xy-emd）：读它的运行日志算真实成功率。
+    # xy-emd 只往 stdout 打日志，没有日志文件；compose 里把宿主机
+    # /var/lib/docker/containers 只读挂进来，这里自动认出哪份 json.log 是它的。
+    # log_dir 为空 / 目录不存在时，这项自动跳过，不影响其它检查。
+    "xyemd": {"log_dir": "/dockerlogs", "log": "", "stale_h": 36},
+    # 播放实探：从 alist 的这个目录里挑一个真实片源，取一次播放地址。
+    # 不用配也能跑；换目录只改 config.json，UI 里没有这一项。
+    "play": {"root": "/每日更新"},
 }
 
 
@@ -123,6 +137,9 @@ def pen(group):
 
 _state_lock = threading.Lock()
 STATE = {"last": None, "running": False, "last_error": "", "phase": ""}
+# 「保存即生效」的信号：保存接口写完配置就 set 它，把调度器叫醒重新排程。
+# 调度器平时只睡觉等时间到，不再轮询磁盘——一天能省四千多次无意义的文件读取。
+_SCHED_WAKE = threading.Event()
 
 
 def set_phase(txt):
@@ -172,12 +189,35 @@ def public_conf(conf):
     return c
 
 
+# runstate 只存「运行状态」，不存配置。旧版本曾把整份配置副本
+# （含 Bark key、界面密码明文）误写进来，读的时候按白名单清掉，
+# 避免敏感信息多存一份、也避免有人误拿这里的过期配置当真。
+_RUNSTATE_KEYS = {
+    "xyemd_log", "play_target", "play_scan_fail_at", "probe_at",
+    "missing_track", "sync_idle", "streak_bad", "verdict", "ts", "lines",
+    "last_kind", "last_push_ts", "bad_fp", "hist_id",
+    "push_fail_streak", "push_fail_msg", "push_fail_ts", "push_ok_ts",
+    "last_crash_ts", "last_crash_push", "incidents", "pause_until",
+    "daily_pushed_date",
+}
+
+
 def load_runstate():
     try:
         with open(RUN_PATH, encoding="utf-8") as f:
-            return json.load(f)
+            st = json.load(f)
     except Exception:
         return {}
+    dirty = [k for k in st if k not in _RUNSTATE_KEYS]
+    if dirty:
+        for k in dirty:
+            st.pop(k, None)
+        try:
+            save_runstate(st)
+            log("runstate 清掉 %d 个残留配置键：%s" % (len(dirty), "、".join(dirty)))
+        except Exception:
+            pass
+    return st
 
 
 def save_runstate(d):
@@ -578,98 +618,405 @@ def _dur_text(h):
     return "%.1f 天" % (h / 24.0)
 
 
-def _emby_label(it):
-    """条目 → 「大理寺日志 S03E10」这种能一眼认出来的名字"""
-    name = str(it.get("Name") or "").strip()
-    series = str(it.get("SeriesName") or "").strip()
-    se, ep = it.get("ParentIndexNumber"), it.get("IndexNumber")
-    if series and se is not None and ep is not None:
-        return "%s S%02dE%02d" % (series, int(se), int(ep))
-    return series or name or "（未命名）"
-
-
 def check_emby(conf):
-    """影音库每日更新检查（可选）。未配置返回 None。
+    """影音库每日同步成没成（可选）。未配置 base 返回 None。
 
-    只问 Emby 自己的账：最近一条入库是什么时候、今天入了多少。
-    为什么不直接读 xy-emd 的日志：那需要 docker.sock 或 NAS 密码，
-    为了一个日志把 root 级权限交给一个带 Web 界面的工具不划算。
-    而且「文件落了盘但 Emby 没扫到」，在用户眼里就是没更新——
-    Emby 这一侧才是真相。
+    两种模式，取决于有没有给 API 密钥：
+      - 只给地址（mode=alive）：问公开端点，判「Emby 还活着、版本多少」。
+      - 地址+密钥（mode=sync）：再判「内容有没有真的进库」（最近入库时间）。
+    
+    只回答一个问题：昨天那轮到底成了没有。判据是 Emby 里最近一条入库
+    的时间——超过 stale_h 没有新条目，就说明这一轮没有内容落地。
+
+    不查集数、不查片名：只关心「成没成」，不关心「更新了啥」。
+    这里只看 Emby 入库时间，是「内容有没有落地」的最终判据。
+    文件级真实成功率由 check_xyemd() 另算：它读 xy-emd 的 stdout 日志
+    （compose 把 /var/lib/docker/containers 只读挂成 /dockerlogs，不需要
+    docker.sock，也不需要 NAS 密码）。它自报的「成功率 100%」是按任务
+    数算的，今天 3 个文件全 404 也照样报 100%，不可信。
+    也不看文件落盘没有：落了盘但 Emby 没扫到，用户眼里就是没更新。
     """
     e = conf.get("emby") or {}
     base = str(e.get("base") or "").strip().rstrip("/")
     key = str(e.get("key") or "").strip()
-    if not base or not key:
+    if not base:
         return None
     try:
         stale_h = float(e.get("stale_h") or 36)
     except Exception:
         stale_h = 36.0
 
-    out = {"base": base, "ok": None, "msg": "", "age_h": None, "today": 0,
-           "counts": {"movie": 0, "series": 0, "episode": 0},
-           "last_name": "", "last_at": "", "stale_h": stale_h}
+    out = {"base": base, "ok": None, "msg": "", "age_h": None,
+           "last_at": "", "stale_h": stale_h}
+
+    # 没给密钥也能判「Emby 还活着没有」：/System/Info/Public 是公开端点，
+    # 不需要 token，返回服务器名和版本。这挡的是最常见的一种事故——
+    # 同步日志全绿、alist 也能取到播放地址，但 Emby 容器本身挂了，
+    # 家里谁都点不开片。有密钥时再往下算「内容有没有进库」。
+    if not key:
+        out["mode"] = "alive"
+        code, txt = http("GET", base + "/System/Info/Public",
+                         headers={"Accept": "application/json"}, timeout=10)
+        if code != 200:
+            out["ok"] = False
+            out["msg"] = ("连不上 Emby（HTTP %s）" % code if code
+                          else "连不上 Emby（%s）" % txt[:60])
+            return out
+        try:
+            info = json.loads(txt) or {}
+        except Exception:
+            info = {}
+        out["ok"] = True
+        out["server"] = str(info.get("ServerName") or "").strip()
+        out["ver"] = str(info.get("Version") or "").strip()
+        return out
+
+    out["mode"] = "sync"
     hdr = {"X-Emby-Token": key, "Accept": "application/json"}
 
-    code, txt = http("GET", base + "/emby/Items/Counts", headers=hdr, timeout=12)
+    q = ("/emby/Items?Recursive=true&SortBy=DateCreated&SortOrder=Descending"
+         "&IncludeItemTypes=Episode,Movie&Limit=1&Fields=DateCreated")
+    code, txt = http("GET", base + q, headers=hdr, timeout=12)
     if code != 200:
         out["ok"] = False
         out["msg"] = ("Emby 返回 HTTP %s（检查地址、端口和 API 密钥）"
                       % code if code else "连不上 Emby（%s）" % txt[:60])
         return out
     try:
-        cnt = json.loads(txt)
+        items = json.loads(txt).get("Items") or []
     except Exception:
         out["ok"], out["msg"] = False, "Emby 返回的不是 JSON"
         return out
-    out["counts"] = {"movie": int(cnt.get("MovieCount") or 0),
-                     "series": int(cnt.get("SeriesCount") or 0),
-                     "episode": int(cnt.get("EpisodeCount") or 0)}
-
-    # 最近一条入库：这就是「库有没有在更新」最直接的证据
-    q = ("/emby/Items?Recursive=true&SortBy=DateCreated&SortOrder=Descending"
-         "&IncludeItemTypes=Episode,Movie&Limit=1"
-         "&Fields=DateCreated,SeriesName,Name,ParentIndexNumber,IndexNumber")
-    code, txt = http("GET", base + q, headers=hdr, timeout=12)
-    if code != 200:
-        out["ok"], out["msg"] = False, "读取最近入库失败（HTTP %s）" % code
+    if not items:
+        out["ok"], out["msg"] = False, "影音库里一条内容都没有"
         return out
-    try:
-        items = json.loads(txt).get("Items") or []
-    except Exception:
-        items = []
-    if items:
-        it = items[0]
-        out["last_at"] = str(it.get("DateCreated") or "")[:19]
-        out["last_name"] = _emby_label(it)
-        dt = _emby_when(it.get("DateCreated"))
-        if dt:
-            out["age_h"] = round(
-                (datetime.now(timezone.utc) - dt).total_seconds() / 3600.0, 1)
 
-    # 今日入库：本地零点换算成 UTC 传给 Emby
-    now = datetime.now(CST)
-    day0 = now.replace(hour=0, minute=0, second=0, microsecond=0)
-    minc = day0.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-    q2 = ("/emby/Items?Recursive=true&IncludeItemTypes=Episode,Movie"
-          "&MinDateCreated=" + minc + "&Limit=1&EnableTotalRecordCount=true")
-    code, txt = http("GET", base + q2, headers=hdr, timeout=12)
-    if code == 200:
-        try:
-            out["today"] = int(json.loads(txt).get("TotalRecordCount") or 0)
-        except Exception:
-            pass
+    it = items[0]
+    out["last_at"] = str(it.get("DateCreated") or "")[:19]
+    dt = _emby_when(it.get("DateCreated"))
+    if dt:
+        out["age_h"] = round(
+            (datetime.now(timezone.utc) - dt).total_seconds() / 3600.0, 1)
 
     if out["age_h"] is None:
-        out["ok"], out["msg"] = True, "已连上，但库里还没有任何条目"
+        out["ok"], out["msg"] = False, "读不出最近入库时间"
     elif out["age_h"] > stale_h:
         out["ok"] = False
-        out["msg"] = ("影音库已经 %s 没有新增内容（最新一条是 %s）"
-                      % (_dur_text(out["age_h"]), out["last_name"] or "未知条目"))
+        out["msg"] = ("影音库已经 %s没有新内容，每日同步大概没跑成"
+                      % _dur_text(out["age_h"]))
     else:
         out["ok"] = True
-        out["msg"] = ""
+    return out
+
+
+# ---------------------------------------------------------------- 小雅同步日志
+# xy-emd（就是每天 2 点写 .strm 的那个容器）只往 stdout 打日志，不落文件。
+# 所以宿主机把 /var/lib/docker/containers 只读挂进本容器，这里自己认出哪份是它的。
+#
+# 为什么不直接用它的「成功率: 100.0% (3/3)」——那个 3 是「库」的数量，不是文件数。
+# 实测 2026-11-16 那轮：3 个文件全 403、一部剧少一集，它照样报 100%。
+# 真实口径只有摘要里的「已下载 N / 下载失败 M」，文件级失败再从 ERROR 行捞。
+XY_ANSI = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+XY_TS = re.compile(r"^(\d{4}-\d\d-\d\d) (\d\d:\d\d:\d\d) - ")
+XY_LIB = re.compile(r"===\s*/media/(.+?)/\s*同步完成摘要\s*===")
+XY_DL = re.compile(r"已下载:\s*(\d+)\s*个文件")
+XY_FAILN = re.compile(r"下载失败:\s*(\d+)\s*个文件")
+XY_DEL = re.compile(r"已删除:\s*(\d+)\s*个文件")
+XY_SIZE = re.compile(r"总下载大小:\s*([\d.]+)\s*MB")
+XY_FAILF = re.compile(r"下载文件\s+(.+?)\s+失败，状态码:\s*(\d+)")
+XY_SEASON = re.compile(r"(?i)season\s*\d+")
+XY_EP = re.compile(r"(?i)s(\d{1,2})\s*e(\d{1,3})")
+
+
+def _xyemd_text(path, max_bytes=6 * 1024 * 1024):
+    """读日志尾部并还原成纯文本。docker 的 json 日志一行一个 {"log": "..."}。"""
+    with open(path, "rb") as f:
+        f.seek(0, os.SEEK_END)
+        size = f.tell()
+        f.seek(max(0, size - max_bytes))
+        buf = f.read()
+    if size > max_bytes and b"\n" in buf:
+        buf = buf.split(b"\n", 1)[1]        # 首行可能被截断，丢掉
+    out = []
+    for line in buf.decode("utf-8", "replace").splitlines():
+        s = line.strip()
+        if not s:
+            continue
+        if s.startswith("{"):
+            try:
+                out.append(json.loads(s).get("log") or "")
+                continue
+            except Exception:
+                pass
+        out.append(line + "\n")
+    return "".join(out)
+
+
+def _xyemd_find(conf, rs):
+    """在挂进来的 docker 日志目录里认出 xy-emd 的那份（日志内容里有同步摘要）。"""
+    xc = conf.get("xyemd") or {}
+    p = str(xc.get("log") or "").strip()
+    if p and os.path.isfile(p):
+        return p
+    d = str(xc.get("log_dir") or "/dockerlogs").strip()
+    if not d or not os.path.isdir(d):
+        return ""
+    cands = []
+    try:
+        subs = os.listdir(d)
+    except OSError:
+        return ""
+    for sub in subs:
+        f = os.path.join(d, sub, sub + "-json.log")
+        if os.path.isfile(f):
+            try:
+                if os.path.getsize(f) < 800:   # 空日志跳过
+                    continue
+                cands.append((os.path.getmtime(f), f))
+            except OSError:
+                pass
+    cands.sort(reverse=True)
+    # 必须全扫：xy-emd 每天 02:00 才写一次，到晚上 mtime 早被别的容器挤到后面，
+    # 只看「最近几个」永远轮不到它。读的是本地文件尾部，几十个也不花钱。
+    for _, f in cands:
+        try:
+            if "同步完成摘要" in _xyemd_text(f, 200000):
+                return f
+        except Exception:
+            continue
+    return ""
+
+
+def _xyemd_show(rel):
+    """从 综艺/国内综艺/花儿与少年 (2014)/Season 8/xxx.strm 里取出「花儿与少年 (2014)」。"""
+    parts = [p for p in rel.split("/") if p]
+    for i, seg in enumerate(parts):
+        if XY_SEASON.search(seg) and i:
+            return parts[i - 1]
+    return parts[-2] if len(parts) >= 2 else rel
+
+
+def _xyemd_parse(text):
+    """只统计「最近一轮」。日志里留着几十天的记录，混在一起算会全成 100%。"""
+    lines = [XY_ANSI.sub("", l) for l in text.splitlines()]
+    last = ""
+    for l in lines:
+        m = XY_TS.match(l)
+        if m and m.group(1) > last:
+            last = m.group(1)
+    if not last:
+        return {"state": "nolog"}
+    dl = fail = dele = 0
+    mb = 0.0
+    libs = 0
+    bad = {}
+    last_ts = ""
+    done = False
+    cur = ""
+    for l in lines:
+        m = XY_TS.match(l)
+        if m:
+            cur = m.group(1)
+            if cur == last:
+                last_ts = m.group(1) + " " + m.group(2)
+        if cur != last:
+            continue
+        if XY_LIB.search(l):
+            libs += 1
+        m = XY_DL.search(l)
+        if m:
+            dl += int(m.group(1))
+        m = XY_FAILN.search(l)
+        if m:
+            fail += int(m.group(1))
+        m = XY_DEL.search(l)
+        if m:
+            dele += int(m.group(1))
+        m = XY_SIZE.search(l)
+        if m:
+            mb += float(m.group(1))
+        m = XY_FAILF.search(l)
+        if m:
+            bad[m.group(1)] = m.group(2)
+        if "同步任务执行完成" in l:
+            done = True
+    eps = {}
+    for rel in bad:
+        base = rel.rsplit("/", 1)[-1]
+        m = XY_EP.search(base)
+        tag = ("S%02dE%02d" % (int(m.group(1)), int(m.group(2)))) if m else base[:28]
+        eps.setdefault(_xyemd_show(rel), set()).add(tag)
+    tot = dl + fail
+    return {"state": "ok", "date": last, "last_ts": last_ts, "libs": libs,
+            "dl": dl, "fail": fail, "deleted": dele, "mb": round(mb, 1),
+            "pct": round(dl * 100.0 / tot, 1) if tot else (100.0 if done else None),
+            "files_failed": len(bad), "done": done,
+            "missing": {k: sorted(v) for k, v in sorted(eps.items())},
+            "missing_eps": sum(len(v) for v in eps.values())}
+
+
+def check_xyemd(conf, rs):
+    """每日同步到底成了几成：拿文件级成功率说话，不看它自报的 100%。"""
+    path = str(rs.get("xyemd_log") or "")
+    if not path or not os.path.isfile(path):
+        path = _xyemd_find(conf, rs)
+        if not path:
+            return None
+        rs["xyemd_log"] = path
+        save_runstate(rs)
+    try:
+        r = _xyemd_parse(_xyemd_text(path))
+    except Exception as e:
+        return {"ok": None, "state": "err",
+                "msg": "读同步日志出错（%s）" % type(e).__name__}
+    if r.get("state") != "ok":
+        return {"ok": None, "state": r.get("state"),
+                "msg": "同步日志里认不出任务记录"}
+    xc = conf.get("xyemd") or {}
+    try:
+        stale_h = float(xc.get("stale_h") or 36)
+    except Exception:
+        stale_h = 36.0
+    age_h = None
+    if r.get("last_ts"):
+        try:
+            dt = datetime.strptime(r["last_ts"], "%Y-%m-%d %H:%M:%S")
+            age_h = round((datetime.now(CST).replace(tzinfo=None)
+                           - dt).total_seconds() / 3600.0, 1)
+        except Exception:
+            pass
+    r["age_h"] = age_h
+    r["stale_h"] = stale_h
+    pct = r.get("pct")
+    if age_h is None:
+        r["ok"], r["msg"] = None, "读不出同步时间"
+    elif age_h > stale_h:
+        r["ok"] = False
+        r["msg"] = "已经 %s 没跑过同步了" % _dur_text(age_h)
+    elif pct is not None and pct < 90:
+        r["ok"] = False
+        r["msg"] = "本轮只成功 %.1f%%（失败 %d 个文件）" % (pct, r["fail"])
+    elif not r.get("done") and age_h > 2:
+        r["ok"] = False
+        r["msg"] = "上一轮同步没跑完就停了（最后一条日志 %s 前）" % _dur_text(age_h)
+    else:
+        r["ok"] = True
+    return r
+
+
+# ---------------------------------------------------------------- 播放链路
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """不让 urllib 跟着跳。302 本身就是「能播」的证据——跟下去会被 CDN
+    的防盗链拦住（实测 115：带客户端 UA 反而 403、不带反而 206），
+    拿最终响应码做判据会天天误报。"""
+
+    def redirect_request(self, *a, **kw):
+        return None
+
+
+PLAY_VID = (".mp4", ".mkv", ".avi", ".ts", ".m2ts", ".flv", ".wmv")
+
+
+def _d_head(base, path):
+    """GET /d/<path> 不跟随跳转，只看响应码属于哪一类。
+
+    返回 (cls, code, extra)：
+      ok    200 或 3xx  —— alist 认得这个路径，能跟上游要到播放地址
+      bad   401 / 403    —— 凭证失效，全家都放不出来
+      gone  404          —— 片子没了（每日更新天天删旧片，属正常现象）
+      err   其他 / 超时   —— 上游故障或网络问题
+    带 Range 是为了在 alist 代理模式下把真正传输的字节压到 1 字节。"""
+    url = base.rstrip("/") + "/d/" + quote(path)
+    req = urllib.request.Request(
+        url, headers={"Range": "bytes=0-0", "User-Agent": "alist-watch"})
+    try:
+        with urllib.request.build_opener(_NoRedirect).open(req, timeout=20) as r:
+            return "ok", r.status, ""
+    except urllib.error.HTTPError as e:
+        c = e.code
+        if c in (301, 302, 303, 307, 308):
+            return "ok", c, urlparse(e.headers.get("Location") or "").netloc
+        if c in (401, 403):
+            return "bad", c, ""
+        if c == 404:
+            return "gone", c, ""
+        return "err", c, ""
+    except Exception as e:
+        return "err", None, type(e).__name__
+
+
+def _scan_play_file(base, root, budget=80, maxdepth=6):
+    """在 alist 里广度优先找一个真实存在的视频文件。
+    只在这个根目录里找，不会把整个源扫穿。
+    实测：每日更新的目录树很宽（一级 5 个、第二层就排了 300 多个），
+    找到第一个视频大约要扫 30 个目录，所以预算给到 80 留余量。
+    扫不到不算故障（返回 None），只在日志里记一笔。"""
+    seen, queue = 0, [(root, 0)]
+    while queue and seen < budget:
+        cur, dep = queue.pop(0)
+        code, txt = http("POST", base.rstrip("/") + "/api/fs/list",
+                         {"path": cur, "password": "", "page": 1,
+                          "per_page": 50}, timeout=20)
+        if code != 200:
+            return None, "列目录失败 HTTP %s" % code
+        try:
+            ct = (json.loads(txt).get("data") or {}).get("content") or []
+        except Exception:
+            return None, "目录返回无法解析"
+        seen += 1
+        for i in ct:
+            n = str(i.get("name") or "")
+            p = cur.rstrip("/") + "/" + n
+            if i.get("is_dir"):
+                if dep < maxdepth:
+                    queue.append((p, dep + 1))
+            elif n.lower().endswith(PLAY_VID):
+                return p, ""
+    return None, "扫了 %d 个目录没找到视频" % seen
+
+
+def check_play(conf, rs):
+    """播放链路实探：家人点开一集，到底能不能出图。
+
+    比 fs/list 更贴近真实使用——能列目录不等于能拿到播放地址。
+    选中的片源会记在 runstate 里，命中缓存时每轮只花 1 次请求；
+    返回 404 说明那片被每日更新删了，换一个再试，不算故障。"""
+    base = str(conf.get("alist_base") or "").strip()
+    if not base:
+        return None
+    root = str((conf.get("play") or {}).get("root") or "/每日更新")
+    path = str((rs.get("play_target") or {}).get("path") or "")
+    out = {"ok": None, "path": path, "code": None, "msg": "", "host": ""}
+    # 扫不到片源时别每轮都重扫 80 个目录，歇一天再来
+    if not path and time.time() - float(rs.get("play_scan_fail_at") or 0) < 86400:
+        out["msg"] = "上次没找到可探的片源，今天不再重扫"
+        return out
+
+    for attempt in (1, 2):
+        if not path:
+            path, err = _scan_play_file(base, root)
+            if not path:
+                rs["play_scan_fail_at"] = time.time()
+                save_runstate(rs)
+                out["ok"], out["msg"] = None, "找不到可探测的片源：%s" % err
+                return out
+        cls, code, extra = _d_head(base, path)
+        if cls == "ok":
+            rs["play_target"] = {"path": path, "ts": time.time()}
+            rs.pop("play_scan_fail_at", None)
+            save_runstate(rs)
+            out.update(ok=True, path=path, code=code, host=extra)
+            return out
+        if cls == "bad":
+            out.update(ok=False, path=path, code=code,
+                       msg="播放地址被拒（HTTP %s），网盘凭证大概失效了" % code)
+            return out
+        if cls == "gone" and attempt == 1:
+            path = ""       # 这片被每日更新删了，换一个再试，别当故障报
+            continue
+        out.update(ok=False, path=path, code=code,
+                   msg="播放地址打不开（%s）" % (extra or "HTTP %s" % code))
+        return out
     return out
 
 
@@ -745,8 +1092,11 @@ def check_once(conf):
     detail["refresh_age_h"] = refresh_age
     if token_url and "127.0.0.1" not in token_url and "localhost" not in token_url:
         warns.append("open_token_url 不是本地代理：%s" % token_url)
+    # 这个时间戳是 G-Box 每日计划任务（默认 09:00）跑完后写的，
+    # 任务里既刷 token 也做阿里签到；按需刷新不会写它。
+    # 所以 36 小时 = 一天半没跑过这个任务，比"按次刷新"的判断更有意义。
     if refresh_age is not None and refresh_age > 36:
-        issues.append("token 自动刷新已停 %.0f 小时" % refresh_age)
+        issues.append("G-Box 每日任务已 %.0f 小时没跑（token 未刷新）" % refresh_age)
 
     # 4) 按分组判定
     #    实测（fs/list 真打上游）是有成本的，这里做节流：
@@ -786,12 +1136,16 @@ def check_once(conf):
                     "group": g, "personal": len(pers), "bad_personal": 0,
                     "share_work": len([s for s in shs if s["status"] == "work"]),
                     "share_total": len(shs), "status": "off",
+                    "personal_paths": [x["path"] for x in pers][:6],
                     "detail": "", "probe": "", "probe_info": "已关闭监控"})
                 continue
             bad_p = [s for s in pers if s["status"] != "work"]
             work_s = [s for s in shs if s["status"] == "work"]
             item = {"group": g, "personal": len(pers), "bad_personal": len(bad_p),
                     "share_work": len(work_s), "share_total": len(shs),
+                    # 个人盘可能不止一个（阿里云盘的资源盘/备份盘各挂一条），
+                    # 把挂载路径带出去，界面上悬停能看明白到底是哪几个
+                    "personal_paths": [x["path"] for x in pers][:6],
                     "status": "ok", "detail": "", "probe": "", "probe_info": "",
                     "emoji": meta["emoji"], "slug": meta["slug"], "en": meta["en"]}
             if pers and bad_p:
@@ -862,34 +1216,110 @@ def check_once(conf):
         rs["probe_at"] = pat
         save_runstate(rs)
 
-    # 5) 影音库（可选）：Emby 最近一条入库离现在多久
+    # 5) 小雅同步：读 xy-emd 日志，算文件级真实成功率（这项不需要 Emby 密钥）
+    set_phase("读取小雅同步日志")
+    xym = None
+    try:
+        xym = check_xyemd(conf, rs)
+    except Exception as e:
+        xym = {"ok": None, "state": "err",
+               "msg": "同步日志检查出错（%s）" % type(e).__name__}
+    if xym:
+        # 空转检测：整天「零下载 + 零失败 + 零清理」却报成功——它「成功地
+        # 什么都没干」（0/0 也算 100%），比失败更阴，当天就要通报。
+        try:
+            if _sync_idle(rs, xym):
+                save_runstate(rs)
+        except Exception as e:
+            log("空转检测出错：", e)
+        detail["xyemd"] = xym
+        if xym.get("ok") is False:
+            issues.append("每日同步：" + (xym.get("msg") or "异常"))
+        # 缺集连续天数：单天新缺不打扰，连续多天才在推送里点名
+        if xym.get("missing"):
+            try:
+                _missing_track(rs, xym)
+                chronic = _missing_chronic(rs)
+                if chronic:
+                    detail["missing_chronic"] = chronic
+                    xym["missing_chronic"] = chronic
+                save_runstate(rs)
+            except Exception as e:
+                log("缺集跟踪出错：", e)
+        elif rs.get("missing_track"):
+            rs["missing_track"] = {}          # 补齐了，清掉旧账
+            save_runstate(rs)
+
+    # 5b) 影音库（可选）：昨天那轮同步成没成
     set_phase("检查影音库更新")
     emb = None
     try:
         emb = check_emby(conf)
     except Exception as e:
         emb = {"ok": False, "msg": "影音库检查出错（%s）" % type(e).__name__,
-               "age_h": None, "today": 0, "counts": {}, "stale_h": 36}
+               "age_h": None, "stale_h": 36}
     if emb:
         detail["emby"] = emb
         if emb.get("ok") is False:
             issues.append(emb.get("msg") or "影音库检查未通过")
-        else:
-            tail = ""
-            if emb.get("today"):
-                tail = "，今日 %d 集" % emb["today"]
-            lines.append("🎬 影音库 %s入库%s"
-                         % (_age_text(emb.get("age_h")), tail))
-    elif (conf.get("emby") or {}).get("base"):
-        # 只填了地址没填密钥：不算问题，别让它把每轮结论拖成 WARN
-        log("影音库已配地址但缺 API 密钥，本轮跳过")
+        elif emb.get("mode") == "alive":
+            # 没配密钥不算问题：公开端点已经能证明 Emby 活着，
+            # 只是判不了「新内容有没有进库」，别拖成每轮 WARN
+            log("影音库只配了地址、没有 API 密钥：本轮只判 Emby 存活")
+
+    # 6) 播放链路：家人点开一集，到底能不能出图
+    set_phase("实探播放链路")
+    ply = None
+    try:
+        ply = check_play(conf, rs)
+    except Exception as e:
+        ply = {"ok": None, "msg": "播放实探出错（%s）" % type(e).__name__}
+    if ply:
+        detail["play"] = ply
+        if ply.get("ok") is False:
+            issues.append(ply.get("msg") or "播放链路实探未通过")
+
+    # 影音库与播放合成一行：只说成没成，不说更了什么
+    if emb or ply or xym:
+        bits, bad_any = [], False
+        if xym and xym.get("pct") is not None:
+            bits.append("同步 %.1f%%" % xym["pct"])
+            if xym.get("missing_eps"):
+                bits.append("缺 %d 集" % xym["missing_eps"])
+            if xym.get("ok") is False:
+                bad_any = True
+            # 日志全绿但 Emby 挂了是另一回事：家里谁都点不开片，必须单独说
+            if emb and emb.get("ok") is False:
+                bits.append("Emby 连不上")
+                bad_any = True
+        elif xym and xym.get("ok") is False:
+            bits.append("同步异常")
+            bad_any = True
+        elif emb and emb.get("ok") is not None:
+            # 没有日志口径时，Emby 只能当「活着没有」用，别说成「同步正常」
+            alive_only = (emb.get("mode") == "alive")
+            if emb.get("ok") is False:
+                bits.append("Emby 连不上" if alive_only else "同步失败")
+                bad_any = True
+            else:
+                bits.append("Emby 在线" if alive_only else "同步正常")
+        if ply and ply.get("ok") is not None:
+            if ply.get("ok") is False:
+                bits.append("播放失败")
+                bad_any = True
+            else:
+                bits.append("播放正常")
+        if bits:
+            lines.append("🎬 影音库 %s%s" % ("❌ " if bad_any else "✅ ",
+                                             " · ".join(bits)))
 
     set_phase("汇总结果")
     if skipped:
         log("跳过 %d 个纯分享盘分组（没有个人盘）：%s"
             % (len(skipped), "、".join(skipped)))
-    if refresh_age is not None:
-        lines.append("🔄 token 刷新 %.0f 小时前" % refresh_age)
+    # 「每日任务几小时前跑过」不进正文：正常时它在 0–24 之间打转，没有信息量；
+    # 真出问题（>36h）会走下面的 issues 报警，阿里存储实测也会先失败。
+    # 只留在 detail 里，点开某轮详情能看到。
     detail["issues"] = issues
     detail["warns"] = warns
     detail["skipped_groups"] = skipped
@@ -946,9 +1376,10 @@ def bark_push(conf, title, body, level="active", jump=""):
     return False, last
 
 
-def bark_render(conf, verdict, lines, detail=None, now=None):
+def bark_render(conf, verdict, lines, detail=None, now=None, daily=None):
     """按用户配置的模板渲染推送内容，返回 (title, body, level)
     可用占位符：{date} {time} {verdict} {count} {bad}"
+    daily 非空表示这是当天的日报（落在第一轮），正文前面会多一行「昨日 N 轮」回顾。
     """
     b = conf.get("bark") or {}
     now = now or datetime.now(CST)
@@ -968,6 +1399,13 @@ def bark_render(conf, verdict, lines, detail=None, now=None):
     if verdict == "OK":
         title = fmt(b.get("title_ok") or "✅ 网盘正常 {date} {time}")
         level = b.get("level_ok") or "active"
+        if daily:
+            r = (daily.get("rounds") or {})
+            if r.get("tot"):
+                head = "昨日 %d 轮巡检：%d 轮正常" % (r["tot"], r.get("ok", 0))
+                if r.get("bad"):
+                    head += "、%d 轮异常（已恢复）" % r["bad"]
+                body = head + "\n" + body
     elif verdict == "WARN":
         title = "⚠️ 巡检降级（结论不可信）"
         level = "active"
@@ -983,11 +1421,128 @@ def bark_render(conf, verdict, lines, detail=None, now=None):
         body += "\n\n近期不稳：" + "、".join(
             "%s %d/%d 轮失败" % (g, v.get("fail", 0), v.get("tot", 0))
             for g, v in sorted(fl.items()))
+    # 连续多天缺同一集：单天新缺不报，连续 >=2 天才值得动手换源
+    ch = detail.get("missing_chronic") or []
+    if ch:
+        body += "\n\n老账：" + "、".join(
+            "%s %s 已缺 %d 天" % (i["show"], i["ep"], i["days"]) for i in ch[:3])
+        if len(ch) > 3:
+            body += " 等 %d 项" % len(ch)
     return title, body, level
 
 
+# ---------------------------------------------------------------- 空转检测
+def _sync_idle(rs, xym):
+    """整天「零下载 + 零失败 + 零清理」= 任务跑了但没干活。
+
+    0/0 会被算成 100%，比失败更难发现，所以单独记账、当天就判异常。
+    按日志日期去重：同一天多次巡检不重复累加。
+    返回累计天数（0 = 有动静，正常）。
+    """
+    prev = rs.get("sync_idle") or {}
+    ld = str(xym.get("date") or "")
+    idle = bool(ld and xym.get("done") and not xym.get("dl")
+                and not xym.get("fail") and not xym.get("deleted"))
+    if not idle:
+        if prev:
+            rs["sync_idle"] = {}              # 有动静了，清账
+        return 0
+    if prev.get("last") == ld:
+        days = int(prev.get("days") or 1)
+    else:
+        days = int(prev.get("days") or 0) + 1
+    rs["sync_idle"] = {"last": ld, "days": days}
+    xym["ok"] = False
+    xym["idle"] = days                        # 推送指纹认「空转」用
+    if days <= 1:
+        xym["msg"] = ("本轮零下载零清理，同步可能在空转"
+                      "（任务跑了但没干活，别被 100% 骗了）")
+    else:
+        xym["msg"] = ("已连续 %d 天零下载零清理，同步可能在空转"
+                      "（任务跑了但没干活）" % days)
+    return days
+
+
+# ---------------------------------------------------------------- 缺集连续跟踪
+def _missing_track(rs, xym, today=None):
+    """记录每部剧每个集号「连续几天缺」。
+
+    单天新缺不吵人（多半是上游还没放出、或那一集 403），
+    连续 ≥2 天才值得提示换源，那才是要动手的事。
+    同一天里多次巡检不重复累加，靠 last 字段挡住。
+    """
+    today = today or datetime.now(CST).strftime("%Y-%m-%d")
+    prev = rs.get("missing_track") or {}
+    cur = {}
+    for show, eps in (xym.get("missing") or {}).items():
+        for ep in (eps or []):
+            k = "%s|%s" % (show, ep)
+            old = prev.get(k) or {}
+            days = int(old.get("days") or 1)
+            last = str(old.get("last") or "")
+            if last == today:
+                pass                          # 今天已经算过，别再 +1
+            elif last:
+                days += 1                     # 上回是往天，继续累计
+            cur[k] = {"days": max(1, days), "last": today,
+                      "first": old.get("first") or today}
+    rs["missing_track"] = cur
+    return cur
+
+
+def _missing_chronic(rs, min_days=2):
+    """连续缺了 >= min_days 天的条目，这些才值得在推送里点名"""
+    out = []
+    for k, v in (rs.get("missing_track") or {}).items():
+        days = int(v.get("days") or 1)
+        if days < min_days:
+            continue
+        show, _, ep = k.partition("|")
+        out.append({"show": show, "ep": ep, "days": days})
+    out.sort(key=lambda x: -x["days"])
+    return out
+
+
+def _quiet_now(conf, now=None):
+    """现在是不是夜间静音时段（默认 00:00–06:00）。
+
+    凌晨出事也修不了：片子跑不了、家人在睡觉。这段时间的推送一律
+    降级成 passive——进通知中心、不响铃，早上自然看到。
+    窗口支持跨零点（start > end，如 23–7）；start == end 表示关闭。
+    """
+    q = conf.get("quiet_hours") or {}
+    try:
+        st = int(q.get("start", 0))
+        en = int(q.get("end", 6))
+    except Exception:
+        st, en = 0, 6
+    st = max(0, min(23, st))
+    en = max(0, min(24, en))
+    if st == en:
+        return False
+    h = (now or datetime.now(CST)).hour
+    if st < en:
+        return st <= h < en
+    return h >= st or h < en
+
+
+def _today_rounds(now=None):
+    """当天已跑几轮、几轮正常、几轮异常（含本轮，hist_add 已先写）"""
+    today = (now or datetime.now(CST)).strftime("%Y-%m-%d")
+    try:
+        con = sqlite3.connect(HIST_PATH, timeout=10)
+        rows = con.execute("select verdict from checks where ts like ?",
+                           (today + "%",)).fetchall()
+        con.close()
+    except Exception:
+        return None
+    tot = len(rows)
+    bad = sum(1 for (v,) in rows if v != "OK")
+    return {"tot": tot, "bad": bad, "ok": tot - bad}
+
+
 # ---------------------------------------------------------------- 执行+推送
-def _decide_push(conf, verdict):
+def _decide_push(conf, verdict, sched=True):
     """按推送策略判断这次要不要发，返回 (要不要发, 原因, 新的 kind)"""
     st = load_runstate()
     n = conf.get("notify") or {}
@@ -1009,6 +1564,10 @@ def _decide_push(conf, verdict):
             reason = "连续异常 %d 轮，未到阈值 %d" % (streak, thr)
         elif last_kind != "bad":
             should, reason = True, "首次异常"
+        elif policy == "change":
+            # change 是严格的「只在状态变化时」：持续异常不再响，
+            # 交给通知中心里那条旧通知自己躺着（与 repeat_bad 无关）
+            reason = "持续异常（change 策略只推变化）"
         elif repeat_bad:
             should, reason = True, "持续异常"
         else:
@@ -1018,8 +1577,20 @@ def _decide_push(conf, verdict):
             should, reason = True, "已恢复"
         elif policy == "always" and conf.get("notify_when_ok", True):
             should, reason = True, "例行汇报"
+        elif policy == "daily" and conf.get("notify_when_ok", True):
+            # 日报模式：全绿时一天只推一条，落在当天第一轮（默认早上 08:30）。
+            # 用「今天推过没有」判断，而不是「是不是最后一轮」——这样
+            # 早上那轮因为容器重启没跑成，中午会补上，不会整天没日报。
+            # 异常不受影响：上一段 is_bad 分支照常立刻推。
+            today = datetime.now(CST).strftime("%Y-%m-%d")
+            if not sched:
+                reason = "手动巡检，不发日报"
+            elif (st.get("daily_pushed_date") or "") != today:
+                should, reason = True, "当日首条日报"
+            else:
+                reason = "今日已推过日报，全绿静默"
         else:
-            reason = "状态未变化"
+            reason = "状态未变化，按策略不推送"
 
     st["verdict"] = verdict
     st["streak_bad"] = streak
@@ -1035,7 +1606,32 @@ def _mark_pushed(kind):
     save_runstate(st)
 
 
-def _execute(conf, push=True):
+def _push_health(ok, msg=""):
+    """记住推送本身成不成。Bark 挂了是最阴的一种故障：
+    巡检一切正常、页面全绿，但你一条通知都收不到。"""
+    st = load_runstate()
+    now = datetime.now(CST).strftime("%Y-%m-%d %H:%M:%S")
+    if ok:
+        st["push_fail_streak"] = 0
+        st["push_fail_msg"] = ""
+        st["push_ok_ts"] = now
+    else:
+        st["push_fail_streak"] = int(st.get("push_fail_streak") or 0) + 1
+        st["push_fail_msg"] = str(msg or "")[:200]
+        st["push_fail_ts"] = now
+    save_runstate(st)
+
+
+def _push_health_state():
+    """给页面看的推送健康摘要"""
+    st = load_runstate()
+    return {"fail_streak": int(st.get("push_fail_streak") or 0),
+            "fail_msg": st.get("push_fail_msg") or "",
+            "fail_ts": st.get("push_fail_ts") or "",
+            "ok_ts": st.get("push_ok_ts") or ""}
+
+
+def _execute(conf, push=True, sched=True):
     """真正跑一次巡检（调用方已持有 running 标记）"""
     verdict, lines, detail = check_once(conf)
     now = datetime.now(CST)
@@ -1052,7 +1648,15 @@ def _execute(conf, push=True):
     res = {"verdict": verdict, "lines": lines, "ts": ts, "push": "", "cat": ts[:10],
            "hist_id": rid}
 
-    should, reason, kind, _st = _decide_push(conf, verdict)
+    # 日报轮：全绿每天只推一条，落在当天第一轮（默认早上）。手动点的巡检不算，
+    # 免得点几次就推几条；正文里的「昨日 N 轮」是对昨天的回顾，早上看更有意义。
+    daily = None
+    if verdict == "OK" and sched:
+        y = _today_rounds(now - timedelta(days=1))
+        if y and y.get("tot"):
+            daily = {"rounds": y}
+
+    should, reason, kind, _st = _decide_push(conf, verdict, sched)
     res["push_reason"] = reason
     if push:
         if not should:
@@ -1061,15 +1665,19 @@ def _execute(conf, push=True):
             res["push"] = "skip"
             res["push_reason"] = "未配置 Bark"
         else:
-            title, body, level = bark_render(conf, verdict, lines, detail, now)
+            title, body, level = bark_render(conf, verdict, lines, detail, now, daily=daily)
             jump = ""
             if verdict == "FAIL":
                 # 点通知直达 alist 存储管理页，省得自己找入口
                 jump = (conf.get("alist_base") or "").rstrip("/") + "/@manage/storage"
                 # 同一个问题只在第一次强提醒，之后几轮转静默进通知中心，恢复才再响
-                fp = "|".join(sorted(i.get("group") or "" for i in
-                                     detail.get("providers", [])
-                                     if i.get("status") == "bad"))
+                bad_keys = sorted(i.get("group") or "" for i in
+                                  detail.get("providers", [])
+                                  if i.get("status") == "bad")
+                # 空转不是哪个网盘的问题，单独给个指纹，第二次起转静默
+                if (detail.get("xyemd") or {}).get("idle"):
+                    bad_keys.append("同步空转")
+                fp = "|".join(bad_keys)
                 st = load_runstate()
                 if fp and fp == (st.get("bad_fp") or "") and st.get("last_kind") == "bad":
                     level = "passive"
@@ -1081,10 +1689,21 @@ def _execute(conf, push=True):
                 st = load_runstate()
                 if st.pop("bad_fp", None) is not None:
                     save_runstate(st)
+            if _quiet_now(conf, now):
+                # 夜间不响铃：进通知中心，早上打开就能看到
+                level = "passive"
+                res["push_reason"] += " · 夜间静音"
             ok, msg = bark_push(conf, title, body, level, jump=jump)
             res["push"] = "ok" if ok else msg
             if ok:
                 _mark_pushed(kind)
+                if verdict == "OK":
+                    # 记下「今天已经推过日报」，后面两轮全绿就静默。
+                    # 只有真推成功了才记，失败的话下一轮会再试。
+                    st = load_runstate()
+                    st["daily_pushed_date"] = now.strftime("%Y-%m-%d")
+                    save_runstate(st)
+            _push_health(ok, msg)      # 推送本身成不成，页面上要看得到
 
     log("巡检完成 %s | 推送=%s %s" % (verdict, res["push"], res.get("push_reason", "")))
     with _state_lock:
@@ -1171,7 +1790,8 @@ def start_run(conf, push=True):
 
     def job():
         try:
-            _execute(conf, push)
+            # 手动点「立即巡检」不算调度轮：不该因为你多点两下就提前把日报发掉
+            _execute(conf, push, sched=False)
         except Exception as e:
             _on_crash(conf, e)
         finally:
@@ -1194,9 +1814,11 @@ def _on_crash(conf, e):
         st = load_runstate()
         last = st.get("last_crash_push") or ""
         if time.time() - float(st.get("last_crash_ts") or 0) > 3600:
+            # 凌晨崩了也别响铃：降成 passive，早上看通知中心
+            lv = "passive" if _quiet_now(conf) else "timeSensitive"
             ok, _ = bark_push(conf, "⚠️ 巡检程序出错",
                               "Netwatch 自己报错了，这一轮没有结果：\n" + msg[:300],
-                              "timeSensitive")
+                              lv)
             if ok:
                 st["last_crash_ts"] = time.time()
                 st["last_crash_push"] = msg[:200]
@@ -1281,13 +1903,14 @@ def scheduler():
                 remain = (nxt - datetime.now(CST)).total_seconds()
                 if remain <= 0:
                     break
-                time.sleep(min(20, max(1, remain)))
-                # 在界面上改了时刻，最多 20 秒就重新排程，不用重启容器
-                nc = load_conf()
-                if schedule_times(nc) != schedule_times(conf):
-                    conf = nc
+                # 睡到下一轮巡检（最长一次睡 60 秒再续）。
+                # 平时不碰磁盘；只有在界面上点了「保存设置」（/_api/save
+                # 会 set _SCHED_WAKE）才会醒来，立刻按新时刻重新排程。
+                if _SCHED_WAKE.wait(timeout=min(60, max(1, remain))):
+                    _SCHED_WAKE.clear()
+                    conf = load_conf()
                     nxt = next_run(conf)
-                    log("巡检时刻改为 %s，重新排程：下次 %s"
+                    log("配置已保存，重新排程：每天 %s，下次 %s"
                         % (schedule_text(conf), nxt.strftime("%m-%d %H:%M")))
             left = paused_left()
             if left > 0:
@@ -1521,7 +2144,7 @@ background:var(--bg);text-align:center}
 
 /* ---------- provider cards ---------- */
 .sec{margin:0 0 8px;display:flex;align-items:baseline;gap:10px}
-.sec h2{font-size:0.8125rem;font-weight:600;color:var(--txt2);margin:0;letter-spacing:0.015em}
+.sec h2{font-size:0.8125rem;font-weight:600;color:var(--txt2);margin:0;letter-spacing:0.015em;flex:none;white-space:nowrap}
 .sec .hint{font-size:0.75rem;color:var(--txt3)}
 .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(232px,1fr));gap:12px;margin-bottom:22px}
 /* 影音库只有一张卡：给个上限，别让它在宽屏上拉成一整行 */
@@ -1552,6 +2175,24 @@ flex:1 1 auto;min-width:0}
 .pv-m .r b{color:var(--txt);font-weight:600;text-align:right;min-width:0;
 overflow-wrap:anywhere}
 
+/* ---------- 影音库宽卡：上面一行 4 个网盘，这里跨满 4 格，上下对齐 ---------- */
+.grid.one{grid-template-columns:minmax(0,1fr)}
+.pv.wide{padding:16px 18px}
+.emg{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px;margin-top:2px}
+.emg .c{border:1px solid var(--line2);border-radius:11px;padding:9px 11px;
+background:var(--surf2);min-width:0}
+.emg .k{display:block;font-size:0.6875rem;color:var(--txt3);line-height:1.4}
+.emg .v{display:block;font-size:1.0625rem;font-weight:650;margin-top:2px;
+letter-spacing:-0.014em;font-variant-numeric:tabular-nums;line-height:1.3;
+white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.emg .v.ok{color:var(--ok)}
+.emg .v.bad{color:var(--bad)}
+.emg .v.warn{color:var(--warn)}
+.emg .s{display:block;font-size:0.6875rem;color:var(--txt3);margin-top:1px;
+line-height:1.4;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.pv.wide .pv-d.mute{-webkit-line-clamp:3}
+@media(max-width:820px){.emg{grid-template-columns:repeat(2,minmax(0,1fr))}}
+
 .statgrid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px;margin-bottom:20px}
 .scard{background:var(--surf);border:1px solid var(--line);border-radius:13px;padding:10px 13px}
 .scard .k{font-size:0.7188rem;color:var(--txt3)}
@@ -1563,7 +2204,7 @@ overflow-wrap:anywhere}
 .pv-d{margin-top:8px;font-size:0.7188rem;line-height:1.55;color:var(--bad);
 white-space:nowrap;overflow:hidden;text-overflow:ellipsis;min-width:0}
 .pv-d.warn{color:var(--warn)}
-.pv-t .fix{font-size:0.75rem;color:var(--bad);text-decoration:none;white-space:nowrap;flex:none}
+.pv-d.mute{color:var(--txt3);white-space:normal;overflow:hidden;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical}.pv-t .fix{font-size:0.75rem;color:var(--bad);text-decoration:none;white-space:nowrap;flex:none}
 .pv-t .fix:hover{text-decoration:underline}
 
 /* ---------- 品牌色 / 抖动 / 事件 ---------- */
@@ -1625,33 +2266,86 @@ border-bottom:2px solid transparent;margin-bottom:-1px;white-space:nowrap;transi
 .panel.on{display:block}
 @keyframes fade{from{transform:translateY(6px)}to{transform:none}}
 
+/* ---------- 页头：每页一句「这页管什么」+ 右侧关键状态 ---------- */
+.pghead{display:flex;align-items:flex-end;gap:14px;margin:0 0 16px;padding:0 2px}
+.pghead .tt{min-width:0}
+.pghead h2{font-size:1.0625rem;font-weight:650;margin:0 0 3px;letter-spacing:-0.016em}
+.pghead p{font-size:0.7812rem;color:var(--txt3);margin:0;line-height:1.5}
+.pgstat{margin-left:auto;flex:none;display:flex;align-items:center;gap:7px;
+padding:6px 11px;border-radius:9px;background:var(--surf2);border:1px solid var(--line);
+font-size:0.7188rem;color:var(--txt2);white-space:nowrap;font-variant-numeric:tabular-nums}
+.pgstat i{width:6px;height:6px;border-radius:50%;background:var(--ok);flex:none}
+.pgstat i.off{background:var(--txt3)}
+@media(max-width:640px){.pghead{flex-wrap:wrap;align-items:flex-start}
+  .pgstat{margin-left:0}}
+
 /* ---------- cards / forms ---------- */
 .card{background:var(--surf);border:1px solid var(--line);border-radius:16px;padding:18px;
-margin-bottom:14px;box-shadow:var(--sh)}
-.card>h3{font-size:0.8438rem;font-weight:600;margin:0 0 4px;letter-spacing:0.007em}
-.card>p.d{font-size:0.7812rem;color:var(--txt3);margin:0 0 15px}
+margin-bottom:12px;box-shadow:var(--sh)}
+/* 标题带一条短竖条做锚点：0.84rem 的字撑不住层级，扫读时抓不住卡片边界 */
+.card>h3{font-size:0.9375rem;font-weight:620;margin:0 0 5px;letter-spacing:-0.008em;
+display:flex;align-items:center;gap:9px;line-height:1.4}
+.card>h3::before{content:"";width:3px;height:13px;border-radius:2px;flex:none;
+background:color-mix(in srgb,var(--brand) 62%,transparent)}
+.card>h3 .tag{margin-left:auto;flex:none;font-size:0.6875rem;font-weight:500;color:var(--txt3);
+background:var(--surf2);border:1px solid var(--line);border-radius:7px;padding:2px 8px;
+font-variant-numeric:tabular-nums}
+.card>p.d{font-size:0.7812rem;color:var(--txt3);margin:0 0 16px;line-height:1.6}
+/* 危险动作与普通设置长得一样，是这套界面最容易误操作的地方 */
+.card.danger{border-color:var(--badln);
+box-shadow:inset 3px 0 0 -1px var(--bad),var(--sh)}
+.card.danger>h3::before{background:var(--bad)}
+.card.danger>h3{color:var(--bad)}
 .row{display:grid;grid-template-columns:1fr 1fr;gap:14px}
 .row3{display:grid;grid-template-columns:1fr 1fr 1fr;gap:14px}
-.f{margin-bottom:13px}
+@media(max-width:640px){.row,.row3{grid-template-columns:1fr}}
+.f{margin-bottom:14px}
 label{display:block;font-size:0.7812rem;color:var(--txt2);margin-bottom:6px;font-weight:500}
-input,select{width:100%;padding:10px 12px;border:1px solid var(--line);border-radius:10px;
+input,select{width:100%;height:42px;padding:0 12px;border:1px solid var(--line);border-radius:10px;
 background:var(--surf2);color:var(--txt);font-size:0.8438rem;outline:none;transition:.16s;
-font-family:inherit}
-input:focus,select:focus{border-color:var(--brand);background:var(--surf);
-box-shadow:0 0 0 3px rgba(0,0,0,.12)}
+font-family:inherit;line-height:1.4;-webkit-appearance:none;appearance:none}
+select{background-image:linear-gradient(45deg,transparent 50%,var(--txt3) 50%),
+linear-gradient(135deg,var(--txt3) 50%,transparent 50%);
+background-position:calc(100% - 16px) 19px,calc(100% - 11px) 19px;background-size:5px 5px;
+background-repeat:no-repeat;padding-right:30px;cursor:pointer}
+/* 原来的黑色 12% 环在暗色主题下等于没有，键盘操作时找不到焦点 */
+input:focus,select:focus{border-color:color-mix(in srgb,var(--brand) 46%,var(--line));
+background:var(--surf);
+box-shadow:0 0 0 3px color-mix(in srgb,var(--brand) 18%,transparent)}
 input::placeholder{color:var(--txt3)}
 .hint{font-size:0.7188rem;color:var(--txt3);margin-top:5px;line-height:1.5}
+/* 卡片级长说明收成左线引用块，避免灰字把表单压散 */
+.hint.quote{margin-top:12px;padding:2px 0 2px 11px;border-left:2px solid var(--line);
+line-height:1.62}
+.hint.quote b{color:var(--txt2);font-weight:600}
+.card>p.d strong{color:var(--txt2);font-weight:600}
+/* 只读状态位：和输入框同高，避免一行里高矮不齐 */
+.qstate{display:flex;align-items:center;gap:7px;height:42px;padding:0 12px;border-radius:10px;
+background:var(--surf2);border:1px solid var(--line);font-size:0.8125rem;color:var(--txt3)}
+.qstate i{width:6px;height:6px;border-radius:50%;background:var(--txt3);flex:none}
+.qstate.on{color:var(--ok);border-color:var(--okln);background:var(--okbg)}
+.qstate.on i{background:var(--ok)}
 .skipnote{font-size:0.7188rem;color:var(--txt3);margin-top:10px;line-height:1.6;
 padding-left:2px}
 .skipnote b{font-weight:600;color:var(--txt2)}
 .hint code{background:var(--line2);padding:1px 5px;border-radius:5px;font-size:0.6875rem}
 
-/* chips */
-.chips{display:flex;flex-wrap:wrap;gap:8px}
-.chip{border:1px solid var(--line);border-radius:11px;padding:9px 13px;font-size:0.8125rem;
-cursor:pointer;user-select:none;background:var(--surf2);transition:.16s;display:flex;
-align-items:center;gap:8px;font-weight:500}
-.chip:hover{border-color:var(--brand)}
+/* 分段保存：每张卡片自己一个按钮，只提交本段的键，旁边标未保存 */
+.blkbar{display:flex;align-items:center;gap:10px;margin-top:16px;padding-top:14px;
+border-top:1px solid var(--line2)}
+.blkst{font-size:0.75rem;color:var(--warn);font-weight:500}
+.blkst.ok{color:var(--ok)}
+
+/* chips：固定高度 + 单行不换行，否则组名长短不同会让每一行高矮不一 */
+.chips{display:flex;flex-wrap:wrap;gap:8px;align-items:flex-start}
+.chip{border:1px solid var(--line);border-radius:11px;height:40px;padding:0 13px;
+box-sizing:border-box;font-size:0.8125rem;cursor:pointer;user-select:none;
+background:var(--surf2);transition:.16s;display:inline-flex;align-items:center;gap:8px;
+font-weight:500;line-height:1;white-space:nowrap;max-width:100%}
+.chip .nm{overflow:hidden;text-overflow:ellipsis;min-width:0}
+.chip:hover{border-color:color-mix(in srgb,var(--brand) 38%,var(--line))}
+/* Apple「按下即反馈」：反馈发生在按下那一刻，不等松手 */
+.chip:active,.tab:active{transform:scale(.97);transition:transform .1s ease-out}
 .chip .sw{width:30px;height:17px;border-radius:20px;background:var(--ok);position:relative;
 transition:.2s;flex:none}
 .chip .sw::after{content:"";position:absolute;top:2px;left:2px;width:13px;height:13px;
@@ -1683,6 +2377,13 @@ th{color:var(--txt3);font-weight:500;font-size:0.7188rem;letter-spacing:0.026em;
 tr:last-child td{border-bottom:0}
 tbody tr:hover{background:var(--surf2)}
 .td-sum{color:var(--txt2);max-width:520px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+/* 数字列右对齐 + 等宽数字，几行扫下去位数对得齐 */
+th.num,td.num{text-align:right;font-variant-numeric:tabular-nums}
+/* 个人盘不止一个时（阿里云盘的资源盘 + 备份盘），数字下面加虚线提示可悬停 */
+td.num .mpath{border-bottom:1px dotted var(--txt3);cursor:help}
+td.num b{font-weight:600}
+tbody tr{transition:background .14s}
+tbody tr:hover{background:color-mix(in srgb,var(--surf2) 70%,var(--line2))}
 
 /* toast */
 #toast{position:fixed;left:50%;bottom:26px;transform:translate(-50%,14px);z-index:99;
@@ -1707,14 +2408,19 @@ border-top-color:currentColor;animation:sp .7s linear infinite}
 @keyframes sp{to{transform:rotate(360deg)}}
 .phase{font-size:0.75rem;color:var(--brand);font-weight:500}
 
-/* ---------- 保存条 ---------- */
+/* ---------- 保存条：浮动层做成半透明材质，内容从下面滚过 ---------- */
 #savebar{position:fixed;left:50%;bottom:22px;transform:translate(-50%,120%);z-index:80;
 display:flex;align-items:center;gap:12px;padding:10px 12px 10px 18px;border-radius:16px;
-background:var(--surf);border:1px solid var(--line);box-shadow:0 18px 40px -18px rgba(16,24,40,.5);
-transition:transform .32s cubic-bezier(.16,1,.3,1);max-width:calc(100vw - 28px)}
+background:color-mix(in srgb,var(--surf) 76%,transparent);
+backdrop-filter:blur(20px) saturate(180%);-webkit-backdrop-filter:blur(20px) saturate(180%);
+border:1px solid var(--line);box-shadow:0 18px 40px -18px rgba(16,24,40,.5);
+transition:transform .32s cubic-bezier(.16,1,.3,1),border-color .2s;max-width:calc(100vw - 28px)}
 #savebar.on{transform:translate(-50%,0)}
 #savebar .t{font-size:0.8125rem;color:var(--txt2);white-space:nowrap}
 #savebar .dot{width:7px;height:7px;border-radius:50%;background:var(--warn);flex:none}
+#savebar.ok .dot{background:var(--ok)}
+#savebar.ok .t{color:var(--ok)}
+#savebar.ok{border-color:color-mix(in srgb,var(--ok) 45%,var(--line))}
 
 /* ---------- 详情弹层 ---------- */
 #modal{position:fixed;inset:0;z-index:95;display:none;align-items:center;justify-content:center;
@@ -1779,6 +2485,18 @@ th:nth-child(3),td:nth-child(3){min-width:180px}
   .pv,.hero,.stat,.scard,.card{border-color:var(--line)}
   .pill,.tag-flaky{border-width:1.5px}
 }
+/* 4) 减弱动态：不是没有反馈，是换成不晃眼的等价形式（淡入代替位移） */
+@media (prefers-reduced-motion: reduce){
+  *,*::before,*::after{animation-duration:.01ms!important;animation-iteration-count:1!important;
+    transition-duration:.01ms!important}
+  .panel{animation:none}
+  #savebar{transition:opacity .2s ease}
+}
+/* 5) 减弱透明度：浮动材质退回实心，别让文字和背景搅在一起 */
+@media (prefers-reduced-transparency: reduce){
+  #savebar{background:var(--surf);backdrop-filter:none;-webkit-backdrop-filter:none}
+  .hd{background:var(--bg);backdrop-filter:none;-webkit-backdrop-filter:none}
+}
 </style></head><body>
 
 <div class="hd"><div class="hd-in">
@@ -1816,6 +2534,10 @@ th:nth-child(3),td:nth-child(3){min-width:180px}
 </div></div>
 
 <div class="wrap">
+  <div class="pausebar" id="pushWarnBar" style="display:none">
+    <span id="pushWarnTxt"></span>
+    <button class="btn sm" onclick="location.reload()">刷新看看</button>
+  </div>
   <div class="pausebar" id="pauseBar" style="display:none">
     <span id="pauseTxt"></span>
     <button class="btn sm" onclick="setPause(0)">恢复巡检</button>
@@ -1868,6 +2590,11 @@ th:nth-child(3),td:nth-child(3){min-width:180px}
 
   <!-- ---------- 通知 ---------- -->
   <div class="panel on" id="p-notify">
+    <div class="pghead">
+      <div class="tt"><h2>通知与推送</h2>
+        <p>决定什么时候、用什么方式打扰你。</p></div>
+      <div class="pgstat" id="pgNotify"><i></i><span>—</span></div>
+    </div>
     <div class="card">
       <h3>Bark 推送</h3>
       <p class="d">iOS 上装 Bark App，把 App 首页的服务器地址和 Device Key 填进来即可。</p>
@@ -1903,8 +2630,7 @@ th:nth-child(3),td:nth-child(3){min-width:180px}
               一天 3 条，建议带上 <code>{time}</code>，通知中心里一眼分清早中晚。</div></div>
           <div class="f"><label>异常时的标题模板</label>
             <input id="btbad" placeholder="⛔ 网盘凭证异常" oninput="renderPreview()">
-            <div class="hint">可用 <code>{bad}</code> 自动列出出问题的网盘名，如「⛔ {bad} 凭证失效」</div></div>
-          <div class="f"><label>异常时附带修复建议</label>
+            <div class="hint">可用 <code>{bad}</code> 自动列出出问题的网盘名，如「⛔ {bad} 凭证失效」</div></div>          <div class="f"><label>异常时附带修复建议</label>
             <select id="bhint" onchange="renderPreview()">
               <option value="1">是（正文末尾加「建议：…」）</option>
               <option value="0">否（只发结果）</option>
@@ -1925,34 +2651,41 @@ th:nth-child(3),td:nth-child(3){min-width:180px}
         </div>
       </div>
       <div style="margin-top:6px;display:flex;gap:9px;flex-wrap:wrap">
-        <button class="btn pri" onclick="save(this)">保存设置</button>
         <button class="btn" onclick="testPush(this)">发一条测试</button>
         <button class="btn" onclick="switchTab('notify');previewBad()">预览异常样式</button>
+      </div>
+      <div class="blkbar">
+        <button class="btn pri sm" onclick="saveBlock('bark',this)">保存</button>
+        <span class="blkst" id="st-bark"></span>
       </div>
     </div>
 
     <div class="card">
       <h3>检测时间（每天 3 次）</h3>
-      <p class="d">早、中、晚各巡检一次并推一条通知；保存后立即生效，不用重启容器。
+      <p class="d">早、中、晚各巡检一次并推一条通知。改完点本段「保存」即生效，不用重启容器；
         某一格留空就不跑那一次。</p>
       <div class="row3">
         <div class="f"><label>早上</label><input id="t0" type="time" step="60" oninput="markDirty();updateHbTip()"></div>
         <div class="f"><label>中午</label><input id="t1" type="time" step="60" oninput="markDirty();updateHbTip()"></div>
         <div class="f"><label>晚上</label><input id="t2" type="time" step="60" oninput="markDirty();updateHbTip()"></div>
       </div>
-      <div class="hint">每轮之间会顺手核对 alist 记录，但真正向网盘发请求的「实测」
+      <div class="hint quote">每轮之间会顺手核对 alist 记录，但真正向网盘发请求的「实测」
         仍是同一个网盘 8 小时才一次（见「监控范围」），一天两次实测、三次通知。</div>
+      <div class="blkbar">
+        <button class="btn pri sm" onclick="saveBlock('schedule',this)">保存</button>
+        <span class="blkst" id="st-schedule"></span>
+      </div>
     </div>
 
     <div class="card">
       <h3>推送策略</h3>
-      <p class="d">决定什么时候真的吵你。默认每轮都发（一天 3 条），
-        异常时换成红色强提醒。</p>
+      <p class="d">决定什么时候真的吵你。异常永远立刻推，不受下面策略影响。</p>
       <div class="row3">
         <div class="f"><label>推送时机</label>
           <select id="nok">
+            <option value="daily">每天一条日报（当天第一轮发出）</option>
             <option value="always">每轮都发（每天 3 条）</option>
-            <option value="change">只在状态变化时（含恢复）</option>
+            <option value="change">只在状态变化时（持续异常不重复响）</option>
             <option value="fail">只在异常时（恢复也发一条）</option>
           </select></div>
         <div class="f"><label>连续异常几轮才告警</label>
@@ -1967,14 +2700,40 @@ th:nth-child(3),td:nth-child(3){min-width:180px}
             <option value="0">只提醒一次</option>
           </select></div>
       </div>
-      <div class="hint">「连续几轮」按巡检轮次算：早中晚各一轮，异常要连着 N 轮才算数。
+      <div class="hint quote">「连续几轮」按巡检轮次算：早中晚各一轮，异常要连着 N 轮才算数。
         同一个问题只在第一次强提醒（响铃），之后几轮自动转为静默进通知中心，恢复时再正常提醒。</div>
+      <div class="blkbar">
+        <button class="btn pri sm" onclick="saveBlock('notify',this)">保存</button>
+        <span class="blkst" id="st-notify"></span>
+      </div>
+    </div>
+
+    <div class="card">
+      <h3>夜间静音</h3>
+      <p class="d">这段时间的推送降级成「静默进通知中心」：不响铃、不亮屏，
+        早上打开手机就能看到。凌晨出事本来也修不了，先别吵醒人。</p>
+      <div class="row3">
+        <div class="f"><label>从</label><select id="qst"></select></div>
+        <div class="f"><label>到</label><select id="qen"></select></div>
+        <div class="f"><label>现在</label><div class="qstate" id="qstate"><i></i><span>—</span></div></div>
+      </div>
+      <div class="hint quote">两端填成一样就是关闭静音。跨零点直接填，比如 <b>23:00 → 07:00</b>。
+        只管响铃级别，不管巡检——该跑还是跑，异常该记还是记。</div>
+      <div class="blkbar">
+        <button class="btn pri sm" onclick="saveBlock('quiet',this)">保存</button>
+        <span class="blkst" id="st-quiet"></span>
+      </div>
     </div>
 
   </div>
 
   <!-- ---------- 监控范围 ---------- -->
   <div class="panel" id="p-src">
+    <div class="pghead">
+      <div class="tt"><h2>监控范围</h2>
+        <p>查谁、查多勤。关掉的网盘既不检测也不告警。</p></div>
+      <div class="pgstat" id="pgSrc"><i></i><span>—</span></div>
+    </div>
     <div class="card">
       <h3>实测频率（防封控）</h3>
       <p class="d">「实测」是向网盘真的发一次列表请求，用来确认凭证还能用。
@@ -1989,46 +2748,68 @@ th:nth-child(3),td:nth-child(3){min-width:180px}
         <div class="f"><label>网盘之间间隔（秒）</label>
           <input id="pgap" type="number" min="0" max="30"></div>
       </div>
-      <div class="hint">间隔填 0 = 每轮都实测，不建议。按 8 小时算，
+      <div class="hint quote">间隔填 0 = 每轮都实测，不建议。按 8 小时算，
         一个网盘每天只挨两次请求，比 alist 自己启动时初始化几百个存储轻得多。</div>
+      <div class="blkbar">
+        <button class="btn pri sm" onclick="saveBlock('probe',this)">保存</button>
+        <span class="blkst" id="st-probe"></span>
+      </div>
     </div>
     <div class="card">
-      <h3>监控哪些网盘</h3>
+      <h3>监控哪些网盘<span class="tag" id="discSum">—</span></h3>
       <p class="d">关掉的网盘既不检测也不告警，也不会出现在推送正文里。点一下切换。<br>
         这里只列「填过账号」的网盘：纯分享链接挂进来的分组（比如 ThunderShare）
         没有账号可探，不纳入监测，也不会出现在下方列表里。</p>
       <div class="chips" id="toggles"><span style="color:var(--txt3)">加载中…</span></div>
-      <div style="margin-top:16px"><button class="btn pri" onclick="save(this)">保存设置</button></div>
+      <div class="blkbar">
+        <button class="btn pri sm" onclick="saveBlock('disc',this)">保存</button>
+        <span class="blkst" id="st-disc"></span>
+      </div>
     </div>
     <div class="card">
       <h3>参与统计的存储</h3>
       <p class="d">按驱动自动识别，个人盘与分享盘分开统计。禁用状态的存储不计入。</p>
-      <div class="tbl"><table><thead><tr><th>网盘</th><th>个人盘</th><th>分享盘</th><th>状态</th></tr></thead>
+      <div class="tbl"><table><thead><tr><th>网盘</th><th class="num">个人盘</th>
+        <th class="num">分享盘</th><th>状态</th></tr></thead>
         <tbody id="srcTable"><tr><td colspan="4" style="color:var(--txt3)">暂无</td></tr></tbody></table></div>
     </div>
   </div>
 
   <!-- ---------- 连接 ---------- -->
   <div class="panel" id="p-conn">
+    <div class="pghead">
+      <div class="tt"><h2>连接与安全</h2>
+        <p>程序去哪儿取数据、出事怎么知道、谁能打开这个页面。</p></div>
+      <div class="pgstat" id="pgConn"><i></i><span>—</span></div>
+    </div>
     <div class="card">
       <h3>连接地址</h3>
-      <p class="d">容器内访问 NAS 宿主机用 host.docker.internal。</p>
+      <p class="d">这里填的是<strong>本程序自己要访问的地址</strong>，不是给你浏览器用的。
+        巡检时它要用这些地址去读 alist 的网盘列表、读 G-Box 的后台状态。</p>
       <div class="row">
-        <div class="f"><label>alist 地址</label><input id="alist"></div>
-        <div class="f"><label>G-Box 后台地址（可选）</label><input id="gbox" placeholder="留空则不检查 token 链路"></div>
+        <div class="f"><label>alist 地址</label><input id="alist">
+          <div class="hint">用来读网盘列表、实测凭证、实探播放。填错则所有网盘都测不到</div></div>
+        <div class="f"><label>G-Box 后台地址（可选）</label><input id="gbox">
+          <div class="hint">只用来读 token 状态；不填就跳过这项，不影响其它检查</div></div>
       </div>
       <div class="row">
         <div class="f"><label>G-Box 账号</label><input id="gu"></div>
         <div class="f"><label>G-Box 密码</label><input id="gp" type="password" placeholder="留空不修改"></div>
       </div>
       <div class="f"><label>alist 数据库路径（容器内）</label><input id="adb">
-        <div class="hint">只读挂载，程序不会写入</div></div>
-      <div style="margin-top:4px"><button class="btn pri" onclick="save(this)">保存设置</button></div>
+        <div class="hint">只读挂载，程序不会写入。用来核对存储清单与个人盘/分享盘归属</div></div>
+      <div class="hint quote">容器里访问 NAS 宿主机一律用 <b>host.docker.internal</b>，
+        写 <b>127.0.0.1</b> 会指向容器自己，必然连不上。</div>
+      <div class="blkbar">
+        <button class="btn pri sm" onclick="saveBlock('conn',this)">保存</button>
+        <span class="blkst" id="st-conn"></span>
+      </div>
     </div>
     <div class="card">
       <h3>影音库（Emby · 可选）</h3>
-      <p class="d">填了才会检查。看的是 Emby 里最近一条入库离现在多久——
-        文件落了盘但 Emby 没扫到，你看到的还是旧的，所以只认 Emby 这一侧的账。</p>
+      <p class="d">填了才会检查。只看最近一条入库离现在多久，不问更新了什么——
+        文件落了盘但 Emby 没扫到，你看到的还是旧的，所以只认 Emby 这一侧的账。
+        首页那张卡上的「播放链路」不用配，它借上面的 alist 地址实探。</p>
       <div class="row">
         <div class="f"><label>Emby 地址</label>
           <input id="embase" placeholder="http://host.docker.internal:8096">
@@ -2045,7 +2826,10 @@ th:nth-child(3),td:nth-child(3){min-width:180px}
           <button class="btn" onclick="testEmby(this)">测试连接</button>
           <div class="hint" id="emTest" style="min-height:18px"></div></div>
       </div>
-      <div style="margin-top:4px"><button class="btn pri" onclick="save(this)">保存设置</button></div>
+      <div class="blkbar">
+        <button class="btn pri sm" onclick="saveBlock('emby',this)">保存</button>
+        <span class="blkst" id="st-emby"></span>
+      </div>
     </div>
     <div class="card">
       <h3>外部心跳（可选，但建议配）</h3>
@@ -2056,9 +2840,12 @@ th:nth-child(3),td:nth-child(3){min-width:180px}
         <div class="hint">推荐 healthchecks.io（免费）或 Uptime Kuma 的 Push Monitor：
           建好后把它的 ping 地址填进来。巡检正常跑完 = 上报成功；程序崩溃会额外请求「地址/fail」。留空关闭。</div>
         <div class="hint" id="hbTip" style="color:var(--warn)"></div></div>
-      <div style="margin-top:4px"><button class="btn pri" onclick="save(this)">保存设置</button></div>
+      <div class="blkbar">
+        <button class="btn pri sm" onclick="saveBlock('heartbeat',this)">保存</button>
+        <span class="blkst" id="st-heartbeat"></span>
+      </div>
     </div>
-    <div class="card">
+    <div class="card danger">
       <h3>配置备份</h3>
       <p class="d">换 NAS 或重建容器时一键迁移。导出文件含 Bark Key、G-Box 密码等敏感信息，自己保管好。</p>
       <div style="display:flex;gap:9px;flex-wrap:wrap;align-items:center">
@@ -2068,7 +2855,7 @@ th:nth-child(3),td:nth-child(3){min-width:180px}
         <span class="hint" style="margin:0">导入会覆盖当前全部设置（含密码），导入后立即生效</span>
       </div>
     </div>
-    <div class="card">
+    <div class="card danger">
       <h3>访问密码</h3>
       <p class="d">修改后当前会话立即失效，需要用新密码重新登录。</p>
       <div class="row">
@@ -2097,9 +2884,9 @@ th:nth-child(3),td:nth-child(3){min-width:180px}
 </div>
 
 <div id="toast"></div>
-<div id="savebar"><span class="dot"></span><span class="t">有改动还没保存</span>
-  <button class="btn pri sm" onclick="save(this)">保存</button>
-  <button class="btn ghost sm" onclick="reloadConf()">放弃</button>
+<div id="savebar"><span class="dot"></span><span class="t" id="sbTxt">有改动还没保存</span>
+  <button class="btn pri sm" id="sbSave" onclick="save(this)" title="快捷键 ⌘S / Ctrl+S，一次保存全部改动">全部保存</button>
+  <button class="btn ghost sm" id="sbDrop" onclick="reloadConf()">放弃</button>
 </div>
 <div id="modal" onclick="if(event.target===this)closeModal()">
   <div class="sheet">
@@ -2111,8 +2898,19 @@ th:nth-child(3),td:nth-child(3){min-width:180px}
   </div>
 </div>
 <script>
-var S={conf:{},last:null,provs:[],nextTs:0,dirty:false,poll:null,stats:null};
+var S={conf:{},last:null,provs:[],nextTs:0,dirty:false,poll:null,stats:null,base:null};
 var PM=__PMETA__;
+/* 夜间静音的小时下拉：24 个 option 写死在 HTML 里太占版面，这里生成一次 */
+(function(){
+  [['qst',23],['qen',24]].forEach(function(p){
+    var el=$(p[0]); if(!el) return;
+    for(var h=0;h<=p[1];h++){
+      var o=document.createElement('option');
+      o.value=h; o.textContent=pad2(h)+':00';
+      el.appendChild(o);
+    }
+  });
+})();
 function $(id){return document.getElementById(id)}
 function t(m){var e=$('toast');e.textContent=m;e.classList.add('on');
   clearTimeout(e._h);e._h=setTimeout(function(){e.classList.remove('on')},2400)}
@@ -2153,19 +2951,125 @@ function toggleTheme(){
 (function(){var s='light';try{s=localStorage.getItem('aw-theme')||'light'}catch(e){}
   applyTheme(s)})();
 
-/* ---------- 未保存保护 ---------- */
-function markDirty(){if(S.dirty)return;S.dirty=true;$('savebar').classList.add('on')}
-function clearDirty(){S.dirty=false;$('savebar').classList.remove('on')}
-function editable(el){return el&&(el.tagName==='INPUT'||el.tagName==='SELECT')}
+/* ---------- 未保存保护：按段存 ---------- */
+/* 每张卡片只提交自己那几个键，互不牵连——改到一半的地址不会被别处的保存顺手带走。
+   底部浮条是兜底：显示还有哪几段没存，点它就一次性全存。 */
+var BLOCKS={
+  bark:{name:'通知模板',keys:['bark']},
+  schedule:{name:'检测时间',keys:['schedule']},
+  notify:{name:'推送策略',keys:['notify']},
+  quiet:{name:'夜间静音',keys:['quiet_hours']},
+  probe:{name:'实测频率',keys:['probe']},
+  disc:{name:'监控网盘',keys:['disabled']},
+  conn:{name:'连接地址',keys:['alist_base','gbox_base','gbox_user','alist_db']},
+  emby:{name:'影音库',keys:['emby']},
+  heartbeat:{name:'外部心跳',keys:['heartbeat']}
+};
+function snap(){ return JSON.parse(JSON.stringify(collect())) }
+function dirtyBlocks(){
+  if(!S.base) return [];
+  var a=JSON.parse(S.base), now=snap(), out=[];
+  for(var k in BLOCKS){
+    var ks=BLOCKS[k].keys;
+    for(var i=0;i<ks.length;i++){
+      if(JSON.stringify(a[ks[i]])!==JSON.stringify(now[ks[i]])){ out.push(k); break }
+    }
+  }
+  return out;
+}
+function paintBlocks(){
+  var dirty=dirtyBlocks(), sb=$('savebar');
+  for(var k in BLOCKS){
+    var el=$('st-'+k); if(!el) continue;
+    if(dirty.indexOf(k)>=0){
+      clearTimeout(el._h);                 // 刚存过又改了：立刻改回「未保存」
+      el.textContent='未保存'; el.className='blkst';
+    }else if(el.className.indexOf('ok')<0){ el.textContent=''; el.className='blkst' }
+  }
+  S.dirty=dirty.length>0;
+  if(S.dirty){
+    $('sbTxt').textContent=dirty.map(function(k){return BLOCKS[k].name}).join('、')+' 未保存';
+    clearTimeout(sb._h);                   // 别让上一次的「已保存」定时器把浮条收走
+    sb.classList.remove('ok'); sb.classList.add('on');
+    $('sbSave').style.display=''; $('sbDrop').style.display='';
+  }else if(!sb.classList.contains('ok')){
+    sb.classList.remove('on'); $('sbTxt').textContent='有改动还没保存';
+  }
+}
+function markDirty(){ paintBlocks() }
+function markSaved(k){
+  var el=$('st-'+k); if(!el) return;
+  el.textContent='已保存'; el.className='blkst ok';
+  clearTimeout(el._h);
+  el._h=setTimeout(function(){ if(el.className.indexOf('ok')>=0){
+    el.textContent=''; el.className='blkst' } },2000);
+}
+/* 某一保存成功后，把基线里这一段改成新值，其它段的脏状态不动 */
+function rebase(k){
+  if(!S.base) return;
+  var a=JSON.parse(S.base), now=snap(), ks=BLOCKS[k].keys;
+  for(var i=0;i<ks.length;i++) a[ks[i]]=now[ks[i]];
+  S.base=JSON.stringify(a);
+}
+function collectPart(k){
+  var all=collect(), o={}, ks=BLOCKS[k].keys;
+  for(var i=0;i<ks.length;i++) o[ks[i]]=all[ks[i]];
+  return o;
+}
+async function saveBlock(k,btn){
+  var part=collectPart(k);
+  if(k==='schedule'&&!part.schedule.times.length){ t('早中晚至少要填一个时间'); return }
+  if(k==='conn'){ var gp=$('gp').value; if(gp) part.gbox_pass=gp }
+  if(btn) btn.disabled=true;
+  try{
+    var r=await fetch('/api/save',{method:'POST',body:JSON.stringify(part)})
+      .then(function(x){return x.json()});
+    if(r.ok){
+      if(k==='conn') $('gp').value='';
+      if(k==='emby') $('emkey').value='';
+      rebase(k);
+      markSaved(k);
+      await load();
+      paintBlocks();
+    }else t('保存失败');
+  }catch(e){ t('保存失败：'+e.message) }
+  if(btn) btn.disabled=false;
+}
+/* 底部浮条 = 一次全存（所有段都确实想存时才用） */
+function clearDirty(){
+  S.dirty=false;
+  var sb=$('savebar'); sb.classList.remove('on','ok');
+  $('sbTxt').textContent='有改动还没保存';
+  for(var k in BLOCKS){ var el=$('st-'+k); if(el){ el.textContent=''; el.className='blkst' } }
+}
+function showSaved(msg){
+  S.dirty=false;
+  var sb=$('savebar');
+  sb.classList.add('on'); sb.classList.add('ok');
+  $('sbTxt').textContent=msg||'已保存，立即生效';
+  $('sbSave').style.display='none'; $('sbDrop').style.display='none';
+  clearTimeout(sb._h);
+  sb._h=setTimeout(function(){
+    sb.classList.remove('on','ok');
+    $('sbTxt').textContent='有改动还没保存';
+    $('sbSave').style.display=''; $('sbDrop').style.display='';
+  },1800);
+}
 document.addEventListener('input',function(e){
   var id=e.target&&e.target.id;
-  if(id==='pw'||id==='pw2'||id==='gp')return;
+  if(id==='pw'||id==='pw2')return;      // 密码走独立的「修改密码」按钮
   markDirty();
 });
 document.addEventListener('change',function(e){
   var id=e.target&&e.target.id;
-  if(id==='pw'||id==='pw2'||id==='gp')return;
+  if(id==='pw'||id==='pw2')return;
   markDirty();
+});
+document.addEventListener('keydown',function(e){
+  if((e.metaKey||e.ctrlKey)&&(e.key==='s'||e.key==='S')){
+    e.preventDefault();
+    if(S.dirty) save(null);
+  }
 });
 window.addEventListener('beforeunload',function(e){
   if(S.dirty){e.preventDefault();e.returnValue='';return ''}
@@ -2224,7 +3128,9 @@ function renderPreview(verdictOverride,linesOverride,badOverride){
     if(nm){ if(seen[nm])return; seen[nm]=1 }
     keep.push(s);
   });
-  lines=keep.slice(0,6);
+  // 预览按真实推送全文画：6 个网盘 + 影音库 + 状况行，默认 8 行装得下。
+  // 之前截到 6 行，影音库那行正好被砍掉，看着像推送里没它。
+  lines=keep.slice(0,8);
   var bads=badOverride||S.provs.filter(function(p){return p.status==='bad'}).map(function(p){return p.group});
   var tpl=ver==='OK'?($('btok').value||'✅ 网盘正常 {date} {time}'):($('btbad').value||'⛔ {bad} 需要处理');
   $('pvTitle').textContent = ver==='WARN' ? '⚠️ 巡检降级（结论不可信）' : fmtTpl(tpl,ver,bads);
@@ -2236,6 +3142,18 @@ function renderPreview(verdictOverride,linesOverride,badOverride){
   $('pvBody').textContent=body;
 }
 /* ---------- 加载 ---------- */
+/* Bark 是这套系统唯一的通知出口，它自己坏了是最阴的故障：
+   巡检全绿、页面全绿，但你一条通知都收不到。连续两次失败就在页面顶部亮红灯。 */
+function renderPushWarn(ph){
+  var bar=$('pushWarnBar');
+  if(!bar) return;
+  var n=(ph&&ph.fail_streak)||0;
+  if(n<2){ bar.style.display='none'; return }
+  bar.style.display='';
+  var when=(ph.fail_ts||'').slice(5);
+  $('pushWarnTxt').textContent='Bark 推送已连续失败 '+n+' 次（最近 '+when+
+    '）——手机上可能收不到任何通知，请检查网络或 Bark 服务';
+}
 async function load(){
   var r;
   try{ r=await fetch('/api/state').then(function(x){
@@ -2246,8 +3164,11 @@ async function load(){
   S.provs=(r.detail_providers||[]);
   renderHero(r); renderProvs(r.detail_providers||[]); renderToggles(r.detail_providers||[]);
   renderSkip(r.skipped_groups||[]);
-  renderEmby(r.emby);
-  if(!S.dirty && !editable(document.activeElement)) fillForms(S.conf);
+  renderEmby(r.xyemd, r.emby, r.play);
+  renderPushWarn(r.push_health);
+  updatePgHead();
+  if(!S.dirty){ fillForms(S.conf); S.base=JSON.stringify(collect()) }
+  paintBlocks();
   renderPreview();
   fetch('/api/stats').then(function(x){return x.json()}).then(function(st){
     S.stats=st; renderStats(st);
@@ -2294,8 +3215,11 @@ function renderHero(r){
     txt.textContent=bad+' 个网盘凭证失效'; }
   else if(warn){ hero.classList.add('s-warn'); pulse.className='pulse warn';
     txt.textContent='检测降级，结论需人工确认'; }
-  else if(r.emby && r.emby.ok===false){ hero.classList.add('s-bad'); pulse.className='pulse bad';
-    txt.textContent='影音库断更'; }
+  else if((r.xyemd && r.xyemd.ok===false)||(r.emby && r.emby.ok===false)||
+          (r.play && r.play.ok===false)){
+    hero.classList.add('s-bad'); pulse.className='pulse bad';
+    txt.textContent=(r.play && r.play.ok===false)?'播放链路打不开'
+      :((r.xyemd && r.xyemd.ok===false)?'每日同步没跑成':'影音库断更'); }
   else if(last.verdict==='OK'){ pulse.className='pulse';
     txt.textContent=(provs.length||'全部')+' 个网盘全部正常'; }
   else { pulse.className='pulse warn'; txt.textContent='结果：'+last.verdict; }
@@ -2327,8 +3251,15 @@ function heroSum(r,provs,bad,warn){
     return names.join('、')+' 需要处理：卡片上点「重测」可单独验证，点「去修复」直达 alist 存储管理。';
   }
   if(warn) return '有网盘的分享目录全部失效，但个人盘正常——多为上游取消分享，不一定要改凭证。';
+  if(r.play && r.play.ok===false)
+    return '播放链路实探没通：随便挑了一集取播放地址失败了。先看各网盘卡片是不是全红——全红就是凭证问题。';
+  if(r.xyemd && r.xyemd.ok===false)
+    return '每日同步这次没跑成：'+(r.xyemd.msg||'看日志')+'。xy-emd 容器本身在跑吗？';
+  if(r.xyemd && r.xyemd.missing_eps)
+    return '每日同步已完成，'+(r.xyemd.pct!=null?(r.xyemd.pct.toFixed(1)+'%、'):'')+
+      '有 '+r.xyemd.missing_eps+' 集没下来（多因上游分享返回 403），不影响已入库的内容播放。';
   if(r.emby && r.emby.ok===false)
-    return '影音库已经 '+ageTxt(r.emby.age_h)+'没有新增内容，每日同步大概没跑成功，值得看一眼。';
+    return '影音库已经 '+ageTxt(r.emby.age_h)+'没有新内容，每日同步大概没跑成，值得看一眼。';
   var st=S.stats||{}, days=(st.incidents||{}).days||[], lastBad='';
   for(var i=days.length-1;i>=0;i--){ if(days[i].v==='FAIL'){ lastBad=days[i].d; break } }
   var ago='';
@@ -2405,47 +3336,144 @@ function renderProvs(provs){
   }).join('');
 }
 
-/* 影音库：Emby 最近一次入库离现在多久，就是「每日更新有没有成功」的直接答案 */
+/* 影音库：每日同步的真实成功率（来自 xy-emd 日志）+ 播放链路实探 */
 function ageTxt(h){
   if(h==null) return '未知';
   if(h<1) return '刚刚';
   if(h<24) return Math.round(h)+' 小时前';
   return (h/24).toFixed(1)+' 天前';
 }
-function renderEmby(em){
+function renderEmby(sy, em, ply){
   var box=$('embyBox'), card=$('embyCard'), hint=$('embyHint');
   if(!box) return;
   var base=((S.conf||{}).emby||{}).base||'';
-  if(!em && !base){ box.style.display='none'; return }
+  if(!sy && !em && !ply && !base){ box.style.display='none'; return }
   box.style.display='';
-  if(!em){
+  if(!sy && !em && !ply){
     hint.textContent='';
     var hasKey=((S.conf||{}).emby||{}).key_set;
     card.innerHTML='<div class="card" style="grid-column:1/-1;color:var(--txt3)">'+
       (hasKey?'已配置，等下一轮巡检出结果（或到设置里点「测试连接」）'
-             :'还差一个 API 密钥：到「连接与安全 → 影音库」里填上就能生效')+
+             :'还没读到同步日志：确认 xy-emd 容器跑过一轮，或到「连接与安全 → 影音库」看看提示')+
       '</div>';
     return;
   }
-  var bad=(em.ok===false);
-  var st=bad?'bad':'ok';
-  var label=bad?'断更':(em.ok===null?'未知':'正常');
-  var c=em.counts||{};
-  var rows=[];
-  rows.push('<div class="r"><span>最近入库</span><b>'+esc(ageTxt(em.age_h))+'</b></div>');
-  if(em.last_name)
-    rows.push('<div class="r"><span>最新条目</span><b title="'+esc(em.last_name)+'">'+
-      esc(em.last_name)+'</b></div>');
-  rows.push('<div class="r"><span>今日入库</span><b>'+(em.today||0)+' 集</b></div>');
-  rows.push('<div class="r"><span>库容量</span><b>'+(c.episode||0)+' 集 · '+
-    (c.movie||0)+' 部</b></div>');
-  var note=em.msg?('<div class="pv-d'+(bad?' warn':'')+'">'+esc(em.msg)+'</div>'):'';
-  var th=em.stale_h||36;
-  hint.textContent='超过 '+th+' 小时没有新增才算断更';
-  card.innerHTML='<div class="pv st-'+st+'" style="--c:#52b54b">'+
-    '<div class="pv-t"><span class="pv-n">Emby</span>'+
-    '<span class="pill '+(bad?'bad':'ok')+'">'+label+'</span></div>'+
-    '<div class="pv-m">'+rows.join('')+'</div>'+note+'</div>';
+  var emBad=(em && em.ok===false);
+  var syncBad=(sy && sy.ok===false)||(!sy && emBad);
+  var playBad=(ply && ply.ok===false);
+  // Emby 自己挂了也算异常：日志全绿、播放地址也取得到，但家里谁都点不开片
+  var bad=syncBad||playBad||emBad, st=bad?'bad':'ok';
+
+  /* 宽卡：4 格对齐上面 4 个网盘卡。每个格 = 一个指标 + 一句人话解释 */
+  var cells=[];
+  function cell(k,v,cls,s){
+    return '<div class="c"><span class="k">'+k+'</span><b class="v'+(cls?' '+cls:'')+'">'+
+      v+'</b>'+(s?'<span class="s">'+esc(s)+'</span>':'')+'</div>';
+  }
+  function mbTxt(mb){
+    if(mb==null) return '–';
+    return mb>=1024?((mb/1024).toFixed(mb>=10240?0:1)+' GB'):(Math.round(mb)+' MB');
+  }
+
+  // ① 文件级真实成功率（xy-emd 自报的 100% 不算数，见后端注释）
+  if(sy && sy.pct!=null){
+    var tot=(sy.dl||0)+(sy.fail||0);
+    cells.push(cell('每日同步', sy.pct.toFixed(1)+'%', syncBad?'bad':'ok',
+      (sy.dl||0)+' / '+tot+' 个文件'));
+  }else if(em){
+    var s0=emBad?'连不上'
+      :(em.mode==='alive'?'在线（未配密钥）'
+        :(em.age_h==null?'已连上':'已更新 · '+ageTxt(em.age_h)));
+    cells.push(cell('每日同步', s0, syncBad?'bad':'ok',
+      em.mode==='alive'?'只判存活，不判内容':(em.stale_h?('断更阈值 '+em.stale_h+'h'):'')));
+  }
+  // ② 失败文件：只有真失败才染红，0 就老实写 0
+  if(sy && (sy.dl!=null||sy.fail!=null)){
+    cells.push(cell('下载失败', (sy.fail||0)+' 个', sy.fail?'bad':'',
+      sy.fail?'上游源失效，需要换源':'本轮没有失败文件'));
+  }
+  // ③ 体积：回答「昨天到底搬了多少东西」
+  if(sy && sy.mb!=null){
+    cells.push(cell('下载体积', mbTxt(sy.mb), '',
+      (sy.libs?sy.libs+' 个库':'')+' · 本轮净增'));
+  }
+  // ④ 缺集：连续缺 >=2 天才染黄，单日缺失多半是源慢
+  if(sy && sy.missing_eps){
+    var mxCh=0;
+    if(sy.missing_chronic) for(var ci=0;ci<sy.missing_chronic.length;ci++){
+      var cd=sy.missing_chronic[ci].days||1; if(cd>mxCh) mxCh=cd;
+    }
+    cells.push(cell('缺集', sy.missing_eps+' 集', mxCh>=2?'warn':'',
+      mxCh>=2?('最长连续缺 '+mxCh+' 天'):'单日缺失，明天再看'));
+  }
+  // ⑤ 清理：按保留策略删掉的老片
+  if(sy && sy.date) cells.push(cell('清理旧片', (sy.deleted||0)+' 个', '',
+    '按保留策略删除'));
+  // ⑥ Emby：服务在不在 + 内容进没进库
+  if(em){
+    var emV,emS;
+    if(emBad){ emV='连不上'; emS=(em.msg||'').slice(0,40); }
+    else if(em.mode==='alive'){
+      emV=(em.ver?'v'+em.ver:'在线');
+      emS='未配密钥'+(em.server?' · '+em.server:'');
+    }else{
+      emV=(em.age_h!=null?ageTxt(em.age_h):'已连上');
+      emS=(em.last_at?'最近入库 '+String(em.last_at).replace('T',' ').slice(5,16)
+        :'已连上')+(em.ver?' · v'+em.ver:'');
+    }
+    cells.push(cell('Emby', emV, emBad?'bad':'ok', emS));
+  }
+  // ⑦ 播放链路：实测取一次播放地址，比「服务在线」更接近真实体验
+  if(ply && ply.ok!==null){
+    cells.push(cell('播放链路', playBad?'打不开':'可播', playBad?'bad':'ok',
+      playBad?(ply.msg||'取不到播放地址')
+        :('实探 HTTP '+ply.code+(ply.host?' · '+ply.host:''))));
+  }
+  // ⑧ 这一轮的时间坐标
+  if(sy && sy.last_ts) cells.push(cell('上次同步', String(sy.last_ts).slice(5,16), '',
+    sy.date&&sy.date!==String(sy.last_ts).slice(0,10)?('归属 '+sy.date):'来自 xy-emd 日志'));
+
+  var msgs=[];
+  if(syncBad && sy && sy.msg) msgs.push(sy.msg);
+  else if(syncBad && em && em.msg) msgs.push(em.msg);
+  else if(emBad && em && em.msg) msgs.push(em.msg);
+  if(playBad && ply.msg) msgs.push(ply.msg);
+  var note=msgs.length?('<div class="pv-d warn">'+esc(msgs.join('；'))+'</div>'):'';
+
+  // 缺集明细：只列剧名+集号，别把日志原样倒出来。
+  // 连续缺 >=2 天的在集号后面标「已缺 N 天」——那才是该去换源的
+  var miss=[], chron={};
+  if(sy && sy.missing_chronic) for(var ci3=0;ci3<sy.missing_chronic.length;ci3++){
+    var itc=sy.missing_chronic[ci3]; chron[itc.show+'|'+itc.ep]=itc.days;
+  }
+  if(sy && sy.missing){
+    for(var k in sy.missing){
+      var v=sy.missing[k]||[];
+      var parts=[];
+      for(var j=0;j<v.length&&j<2;j++){
+        var dd=chron[k+'|'+v[j]];
+        parts.push(esc(v[j])+(dd>=2?'（已缺 '+dd+' 天）':''));
+      }
+      miss.push(esc(k)+' '+parts.join('/')+(v.length>2?' 等 '+v.length+' 集':''));
+    }
+  }
+  // 宽卡能放下更多：从 4 条提到 8 条
+  if(miss.length)
+    note+='<div class="pv-d mute" title="'+esc(miss.join('；'))+'">缺集明细：'+
+      miss.slice(0,8).join('；')+(miss.length>8?' 等 '+miss.length+' 部':'')+'</div>';
+  // 实探用的是哪个片源——出问题时这是唯一能复现的线索
+  if(ply && ply.path)
+    note+='<div class="pv-d mute" title="'+esc(ply.path)+'">实探片源：'+esc(ply.path)+'</div>';
+
+  var hasKeyNow=((S.conf||{}).emby||{}).key_set;
+  hint.textContent='成功率按文件算，来自 xy-emd 运行日志'+
+    (hasKeyNow?'':'；Emby 只判存活（未配密钥）');
+  var tt=sy&&sy.last_ts?'<span style="color:var(--txt3);font-size:0.7rem">'+
+    esc(String(sy.last_ts).slice(5,16))+'</span>':'';
+  card.innerHTML='<div class="pv wide st-'+st+'" style="--c:#52b54b">'+
+    '<div class="pv-t"><span class="pv-n">影音库</span>'+tt+
+    '<span class="pill '+(bad?'bad':'ok')+'">'+(bad?'异常':'正常')+'</span></div>'+
+    '<div class="emg">'+cells.join('')+'</div>'+note+'</div>';
 }
 
 function renderStats(st){
@@ -2579,20 +3607,50 @@ function renderSkip(list){
 function renderToggles(provs){
   var tg=$('toggles');
   if(!provs.length){tg.innerHTML='<span style="color:var(--txt3)">暂无</span>';return}
+  /* 有未保存改动时以界面上的开关为准：轮询每 5 秒重建一次，
+     否则刚点下去还没保存的切换会被服务端的旧配置打回去 */
+  var cur={};
+  Array.prototype.forEach.call(tg.querySelectorAll('.chip'),function(e){
+    cur[e.dataset.g]=e.classList.contains('off');
+  });
   tg.innerHTML=provs.map(function(p){
-    return '<div class="chip '+(p.status==='off'?'off':'')+'" data-g="'+esc(p.group)+
-      '" onclick="this.classList.toggle(\'off\');markDirty()">'+
-      '<span class="sw"></span>'+pbadge(p.group)+esc(p.group)+'</div>';
+    var off=(p.status==='off');
+    if(S.dirty&&Object.prototype.hasOwnProperty.call(cur,p.group)) off=cur[p.group];
+    return '<div class="chip '+(off?'off':'')+'" data-g="'+esc(p.group)+
+      '" title="'+esc(p.group)+'" '+
+      'onclick="this.classList.toggle(\'off\');markDirty();updateDiscSum()">'+
+      '<span class="sw"></span>'+pbadge(p.group)+
+      '<span class="nm">'+esc(p.group)+'</span></div>';
   }).join('');
+  updateDiscSum();
   var tb=$('srcTable');
   tb.innerHTML=provs.map(function(p){
     var cls=p.status==='ok'?'ok':(p.status==='bad'?'bad':(p.status==='off'?'mute':'warn'));
     var label={'ok':'正常','bad':'失效','warn':'降级','off':'已关闭'}[p.status]||p.status;
     return '<tr><td>'+pbadge(p.group,'sm')+
       '<b style="margin-left:8px">'+esc(p.group)+'</b></td>'+
-      '<td>'+(p.personal||0)+'</td><td>'+(p.share_work||0)+' / '+(p.share_total||0)+'</td>'+
+      '<td class="num"'+(p.personal>1?' title="'+esc((p.personal_paths||[]).join('\n'))+'"':'')+
+      '>'+'<span class="'+(p.personal>1?'mpath':'')+'">'+(p.personal||0)+'</span></td>'+
+      '<td class="num">'+(p.share_work||0)+' / '+(p.share_total||0)+'</td>'+
       '<td><span class="pill '+cls+'">'+label+'</span></td></tr>';
   }).join('')||'<tr><td colspan="4" style="color:var(--txt3)">暂无</td></tr>';
+}
+/* 已启用几个、关了哪几个，一眼能看到，不用逐个扫 chip */
+function updateDiscSum(){
+  var all=document.querySelectorAll('#toggles .chip');
+  var off=document.querySelectorAll('#toggles .chip.off');
+  var el=$('discSum');
+  if(el&&all.length) el.textContent='已启用 '+(all.length-off.length)+'/'+all.length;
+  var pg=$('pgSrc');
+  if(pg&&S.conf){
+    var pb=S.conf.probe||{};
+    /* 首次渲染时表单还没回填，输入框是空的：以配置值为准，改了才用界面值 */
+    var iv=(pb.min_interval_h!=null?pb.min_interval_h:8);
+    var dv=($('pmin')&&$('pmin').value!=='')?+$('pmin').value:iv;
+    var txt=(pb.enabled===false?'仅看 alist 记录':('实测 '+dv+'h 一次'));
+    pg.querySelector('span').textContent=(all.length?all.length+' 个网盘 · ':'')+txt;
+    pg.querySelector('i').className=(pb.enabled===false?'off':'');
+  }
 }
 
 /* 后端可能给 times 数组，也可能是老配置的 hour/minute */
@@ -2662,7 +3720,7 @@ function fillForms(c){
   $('t0').value=ts[0]||''; $('t1').value=ts[1]||''; $('t2').value=ts[2]||'';
   updateHbTip();
   var n=c.notify||{};
-  $('nok').value=n.policy||'always';
+  $('nok').value=n.policy||'daily';
   $('nthr').value=String(n.fail_threshold||1);
   $('nrep').value=(n.repeat_bad===false?'0':'1');
     $('hburl').value=((c.heartbeat||{}).url)||'';
@@ -2671,7 +3729,45 @@ function fillForms(c){
   var em=c.emby||{};
   $('embase').value=em.base||'';
   $('emstale').value=em.stale_h||36;
+  var q=c.quiet_hours||{start:0,end:6};
+  $('qst').value=String(q.start==null?0:+q.start);
+  $('qen').value=String(q.end==null?6:+q.end);
+  updateQuietState();
   if($('emKeyHint')&&em.key_set) $('emKeyHint').textContent='已保存密钥，留空表示不修改';
+}
+function pad2(n){return ('0'+n).slice(-2)}
+/* 现在这个时刻到底静音没有——比让用户自己对着两个数字算要直观 */
+function updateQuietState(){
+  var el=$('qstate'); if(!el) return;
+  var st=+$('qst').value, en=+$('qen').value;
+  var h=new Date().getHours(), on=false, txt='';
+  if(st===en){ txt='静音已关闭' }
+  else{
+    on=(st<en)?(h>=st&&h<en):(h>=st||h<en);
+    txt=on?('静音中 · 到 '+pad2(en)+':00'):('每天 '+pad2(st)+':00 – '+pad2(en)+':00');
+  }
+  el.classList.toggle('on',on);
+  el.querySelector('span').textContent=txt;
+}
+/* 三页页头右侧的关键状态：切过去先看这一眼 */
+function updatePgHead(){
+  var c=S.conf||{};
+  var np=$('pgNotify');
+  if(np){
+    var ts=scheduleList(c), n=c.notify||{};
+    var pol={'daily':'日报','always':'每轮都推','change':'仅变化时','fail':'仅异常时'}[n.policy||'daily']||'';
+    var q=c.quiet_hours||{}, qon=(+q.start!==+q.end);
+    np.querySelector('span').textContent=(ts.length||0)+' 次/天 · '+pol+(qon?' · 夜间静音':'');
+    var b=c.bark||{};
+    np.querySelector('i').className=(b.url&&b.key)?'':'off';
+  }
+  var cp=$('pgConn');
+  if(cp){
+    var em=c.emby||{};
+    cp.querySelector('span').textContent=(c.alist_base?'alist 已配':'alist 未配')+' · '+
+      (em.base?'Emby 已配':'Emby 未配');
+    cp.querySelector('i').className=(c.alist_base?'':'off');
+  }
 }
 
 function collect(){
@@ -2680,6 +3776,7 @@ function collect(){
       .filter(function(x){return /^\d{1,2}:\d{2}$/.test(x)})},
     notify:{policy:$('nok').value,fail_threshold:+$('nthr').value,
       repeat_bad:$('nrep').value==='1'},
+    quiet_hours:{start:+$('qst').value,end:+$('qen').value},
     bark:{url:$('burl').value.trim(),key:$('bkey').value.trim(),
       group:$('bgroup').value.trim()||'NAS巡检',sound:$('bsound').value,
       level_ok:$('blevel').value,
@@ -2713,7 +3810,7 @@ async function testEmby(btn){
     if(r.ok){
       el.style.color='var(--ok)';
       el.textContent='连上了 · 最近入库 '+(d.age_h==null?'未知':(d.age_h<1?'刚刚':Math.round(d.age_h)+' 小时前'))+
-        ' · 今日 '+(d.today||0)+' 集';
+        '，同步正常';
     }else{
       el.style.color='var(--bad)';
       el.textContent=d.msg||'连接失败';
@@ -2729,7 +3826,13 @@ async function save(btn){
   if(btn) btn.disabled=true;
   try{
     var r=await fetch('/api/save',{method:'POST',body:JSON.stringify(body)}).then(function(x){return x.json()});
-    if(r.ok){ clearDirty(); t('已保存'); $('gp').value=''; $('emkey').value=''; await load(); }
+    if(r.ok){
+      $('gp').value=''; $('emkey').value='';
+      S.dirty=false;                 // 让 load 重设基线
+      await load();
+      paintBlocks();
+      showSaved('已全部保存，立即生效');
+    }
     else t('保存失败');
   }catch(e){t('保存失败：'+e.message)}
   if(btn) btn.disabled=false;
@@ -2763,7 +3866,7 @@ async function importConf(inp){
   try{
     var r=await fetch('/api/import',{method:'POST',body:JSON.stringify(cfg)})
       .then(function(x){return x.json()});
-    if(r.ok){ clearDirty(); t('已导入，配置已生效'); await load(); }
+    if(r.ok){ showSaved('已导入，配置已生效'); await load(); }
     else t('导入失败：'+(r.msg||'未知错误'));
   }catch(e){ t('导入失败：'+e.message) }
 }
@@ -2825,7 +3928,7 @@ async function showHist(id){
   var sub=[];
   if(det.ts) sub.push('检测于 '+det.ts);
   if(det.open_token_url) sub.push('token 代理 '+det.open_token_url);
-  if(det.refresh_age_h!=null) sub.push('刷新间隔 '+det.refresh_age_h+' h');
+  if(det.refresh_age_h!=null) sub.push('G-Box 每日任务 '+det.refresh_age_h+' h 前跑过');
   $('mSub').textContent=sub.join('  ·  ');
   var body=(det.lines||[]).join('\n');
   if(det.issues&&det.issues.length) body+='\n\n问题：\n- '+det.issues.join('\n- ');
@@ -3015,6 +4118,8 @@ class Handler(BaseHTTPRequestHandler):
             detail_providers = []
             skipped_groups = []
             detail_emby = None
+            detail_play = None
+            detail_xyemd = None
             if not last:
                 # 容器刚重启时内存里还没有结果，先用历史最后一轮顶上，
                 # 否则页面会短暂显示「首次检测」+ 全 0，看着像数据丢了
@@ -3039,6 +4144,8 @@ class Handler(BaseHTTPRequestHandler):
                         detail_providers = _d.get("providers", [])
                         skipped_groups = _d.get("skipped_groups", [])
                         detail_emby = _d.get("emby")
+                        detail_play = _d.get("play")
+                        detail_xyemd = _d.get("xyemd")
                 except Exception:
                     pass
             try:
@@ -3056,7 +4163,10 @@ class Handler(BaseHTTPRequestHandler):
                                     "host": host,
                                     "detail_providers": detail_providers,
                                     "skipped_groups": skipped_groups,
-                                    "emby": detail_emby})
+                                    "emby": detail_emby,
+                                    "xyemd": detail_xyemd,
+                                    "play": detail_play,
+                                    "push_health": _push_health_state()})
         if self.path == "/api/history":
             return self._send(200, {"items": hist_list(30)})
         if self.path == "/api/stats":
@@ -3166,6 +4276,15 @@ class Handler(BaseHTTPRequestHandler):
             for k in ("schedule", "bark", "notify", "probe", "heartbeat"):
                 if isinstance(body.get(k), dict):
                     conf[k].update(body[k])
+            # 夜间静音窗口：只有两个小时数，越界就夹回合法区间，
+            # 不让一份手改过的配置把调度算崩
+            if isinstance(body.get("quiet_hours"), dict):
+                try:
+                    qs = max(0, min(23, int(body["quiet_hours"].get("start", 0))))
+                    qe = max(0, min(24, int(body["quiet_hours"].get("end", 6))))
+                except Exception:
+                    qs, qe = 0, 6
+                conf["quiet_hours"] = {"start": qs, "end": qe}
             # emby 单独处理：key 留空表示「不修改」，否则每次保存都会把密钥清掉
             if isinstance(body.get("emby"), dict):
                 em = {k: v for k, v in body["emby"].items()
@@ -3183,6 +4302,7 @@ class Handler(BaseHTTPRequestHandler):
             if isinstance(body.get("disabled"), list):
                 conf["disabled"] = [str(x) for x in body["disabled"]][:200]
             save_conf(conf)
+            _SCHED_WAKE.set()               # 保存即生效：叫醒调度器按新配置排程
             log("配置已保存")
             return self._send(200, {"ok": True,
                                     "public_base": conf.get("public_base", ""),
@@ -3201,6 +4321,7 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as e:
                 return self._send(400, {"ok": False, "msg": str(e)})
             save_conf(conf)
+            _SCHED_WAKE.set()               # 导入备份同样是「保存」，立即生效
             log("配置已从备份导入")
             return self._send(200, {"ok": True,
                                     "schedule_text": schedule_text(conf)})
