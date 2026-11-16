@@ -60,6 +60,10 @@ DEFAULT_CONF = {
     "public_base": "",
     "ui_password": "changeme",
     "disabled": [],
+    # 影音库（Emby）：base 或 key 留空则完全不检查，不影响原有巡检。
+    # key 在 Emby 后台「设置 → 高级 → API 密钥」生成。
+    # stale_h 是断更阈值：最近一条入库超过这么多小时，就认为每日同步出了问题。
+    "emby": {"base": "", "key": "", "stale_h": 36},
 }
 
 
@@ -161,6 +165,10 @@ def public_conf(conf):
     c["ui_password"] = ""
     c["gbox_pass_set"] = bool(conf.get("gbox_pass"))
     c["ui_password_set"] = bool(conf.get("ui_password"))
+    em = dict(c.get("emby") or {})
+    em["key"] = ""
+    em["key_set"] = bool((conf.get("emby") or {}).get("key"))
+    c["emby"] = em
     return c
 
 
@@ -537,6 +545,134 @@ def probe_auth(base, path):
     return "unknown", msg[:90]
 
 
+# ---------------------------------------------------------------- 影音库
+def _emby_when(s):
+    """Emby 的 DateCreated 形如 2026-11-16T02:04:10.1234567Z（7 位小数），
+    fromisoformat 吃不下，直接截到秒再按 UTC 解析。"""
+    try:
+        return datetime.strptime(str(s)[:19], "%Y-%m-%dT%H:%M:%S").replace(
+            tzinfo=timezone.utc)
+    except Exception:
+        return None
+
+
+def _age_text(h):
+    """小时数 → 人话（带「前」）"""
+    if h is None:
+        return "未知"
+    if h < 1:
+        return "刚刚"
+    if h < 24:
+        return "%.0f 小时前" % h
+    return "%.1f 天前" % (h / 24.0)
+
+
+def _dur_text(h):
+    """小时数 → 时长（不带「前」），用于「已经 X 没有新增」"""
+    if h is None:
+        return "未知时长"
+    if h < 1:
+        return "不到 1 小时"
+    if h < 24:
+        return "%.0f 小时" % h
+    return "%.1f 天" % (h / 24.0)
+
+
+def _emby_label(it):
+    """条目 → 「大理寺日志 S03E10」这种能一眼认出来的名字"""
+    name = str(it.get("Name") or "").strip()
+    series = str(it.get("SeriesName") or "").strip()
+    se, ep = it.get("ParentIndexNumber"), it.get("IndexNumber")
+    if series and se is not None and ep is not None:
+        return "%s S%02dE%02d" % (series, int(se), int(ep))
+    return series or name or "（未命名）"
+
+
+def check_emby(conf):
+    """影音库每日更新检查（可选）。未配置返回 None。
+
+    只问 Emby 自己的账：最近一条入库是什么时候、今天入了多少。
+    为什么不直接读 xy-emd 的日志：那需要 docker.sock 或 NAS 密码，
+    为了一个日志把 root 级权限交给一个带 Web 界面的工具不划算。
+    而且「文件落了盘但 Emby 没扫到」，在用户眼里就是没更新——
+    Emby 这一侧才是真相。
+    """
+    e = conf.get("emby") or {}
+    base = str(e.get("base") or "").strip().rstrip("/")
+    key = str(e.get("key") or "").strip()
+    if not base or not key:
+        return None
+    try:
+        stale_h = float(e.get("stale_h") or 36)
+    except Exception:
+        stale_h = 36.0
+
+    out = {"base": base, "ok": None, "msg": "", "age_h": None, "today": 0,
+           "counts": {"movie": 0, "series": 0, "episode": 0},
+           "last_name": "", "last_at": "", "stale_h": stale_h}
+    hdr = {"X-Emby-Token": key, "Accept": "application/json"}
+
+    code, txt = http("GET", base + "/emby/Items/Counts", headers=hdr, timeout=12)
+    if code != 200:
+        out["ok"] = False
+        out["msg"] = ("Emby 返回 HTTP %s（检查地址、端口和 API 密钥）"
+                      % code if code else "连不上 Emby（%s）" % txt[:60])
+        return out
+    try:
+        cnt = json.loads(txt)
+    except Exception:
+        out["ok"], out["msg"] = False, "Emby 返回的不是 JSON"
+        return out
+    out["counts"] = {"movie": int(cnt.get("MovieCount") or 0),
+                     "series": int(cnt.get("SeriesCount") or 0),
+                     "episode": int(cnt.get("EpisodeCount") or 0)}
+
+    # 最近一条入库：这就是「库有没有在更新」最直接的证据
+    q = ("/emby/Items?Recursive=true&SortBy=DateCreated&SortOrder=Descending"
+         "&IncludeItemTypes=Episode,Movie&Limit=1"
+         "&Fields=DateCreated,SeriesName,Name,ParentIndexNumber,IndexNumber")
+    code, txt = http("GET", base + q, headers=hdr, timeout=12)
+    if code != 200:
+        out["ok"], out["msg"] = False, "读取最近入库失败（HTTP %s）" % code
+        return out
+    try:
+        items = json.loads(txt).get("Items") or []
+    except Exception:
+        items = []
+    if items:
+        it = items[0]
+        out["last_at"] = str(it.get("DateCreated") or "")[:19]
+        out["last_name"] = _emby_label(it)
+        dt = _emby_when(it.get("DateCreated"))
+        if dt:
+            out["age_h"] = round(
+                (datetime.now(timezone.utc) - dt).total_seconds() / 3600.0, 1)
+
+    # 今日入库：本地零点换算成 UTC 传给 Emby
+    now = datetime.now(CST)
+    day0 = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    minc = day0.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    q2 = ("/emby/Items?Recursive=true&IncludeItemTypes=Episode,Movie"
+          "&MinDateCreated=" + minc + "&Limit=1&EnableTotalRecordCount=true")
+    code, txt = http("GET", base + q2, headers=hdr, timeout=12)
+    if code == 200:
+        try:
+            out["today"] = int(json.loads(txt).get("TotalRecordCount") or 0)
+        except Exception:
+            pass
+
+    if out["age_h"] is None:
+        out["ok"], out["msg"] = True, "已连上，但库里还没有任何条目"
+    elif out["age_h"] > stale_h:
+        out["ok"] = False
+        out["msg"] = ("影音库已经 %s 没有新增内容（最新一条是 %s）"
+                      % (_dur_text(out["age_h"]), out["last_name"] or "未知条目"))
+    else:
+        out["ok"] = True
+        out["msg"] = ""
+    return out
+
+
 # ---------------------------------------------------------------- 巡检
 def check_once(conf):
     """执行一次巡检，返回 (verdict, summary_lines, detail)"""
@@ -725,6 +861,28 @@ def check_once(conf):
     if probed_now:
         rs["probe_at"] = pat
         save_runstate(rs)
+
+    # 5) 影音库（可选）：Emby 最近一条入库离现在多久
+    set_phase("检查影音库更新")
+    emb = None
+    try:
+        emb = check_emby(conf)
+    except Exception as e:
+        emb = {"ok": False, "msg": "影音库检查出错（%s）" % type(e).__name__,
+               "age_h": None, "today": 0, "counts": {}, "stale_h": 36}
+    if emb:
+        detail["emby"] = emb
+        if emb.get("ok") is False:
+            issues.append(emb.get("msg") or "影音库检查未通过")
+        else:
+            tail = ""
+            if emb.get("today"):
+                tail = "，今日 %d 集" % emb["today"]
+            lines.append("🎬 影音库 %s入库%s"
+                         % (_age_text(emb.get("age_h")), tail))
+    elif (conf.get("emby") or {}).get("base"):
+        # 只填了地址没填密钥：不算问题，别让它把每轮结论拖成 WARN
+        log("影音库已配地址但缺 API 密钥，本轮跳过")
 
     set_phase("汇总结果")
     if skipped:
@@ -1366,6 +1524,8 @@ background:var(--bg);text-align:center}
 .sec h2{font-size:0.8125rem;font-weight:600;color:var(--txt2);margin:0;letter-spacing:0.015em}
 .sec .hint{font-size:0.75rem;color:var(--txt3)}
 .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(232px,1fr));gap:12px;margin-bottom:22px}
+/* 影音库只有一张卡：给个上限，别让它在宽屏上拉成一整行 */
+.grid.one{grid-template-columns:minmax(232px,560px)}
 .pv{position:relative;display:flex;flex-direction:column;border:1px solid var(--line);
 border-radius:15px;padding:14px 15px 13px;background:var(--surf);box-shadow:var(--sh);
 overflow:hidden;min-width:0;transition:.18s}
@@ -1695,6 +1855,11 @@ th:nth-child(3),td:nth-child(3){min-width:180px}
   <div class="grid" id="pvs"><div class="card" style="grid-column:1/-1;color:var(--txt3)">暂无数据</div></div>
   <div class="skipnote" id="skipNote" style="display:none"></div>
 
+  <div id="embyBox" style="display:none">
+    <div class="sec"><h2>影音库</h2><span class="hint" id="embyHint"></span></div>
+    <div class="grid one" id="embyCard"></div>
+  </div>
+
   <div class="tabs">
     <div class="tab on" data-t="notify" onclick="switchTab('notify')">通知与推送</div>
     <div class="tab" data-t="src" onclick="switchTab('src')">监控范围</div>
@@ -1858,6 +2023,28 @@ th:nth-child(3),td:nth-child(3){min-width:180px}
       </div>
       <div class="f"><label>alist 数据库路径（容器内）</label><input id="adb">
         <div class="hint">只读挂载，程序不会写入</div></div>
+      <div style="margin-top:4px"><button class="btn pri" onclick="save(this)">保存设置</button></div>
+    </div>
+    <div class="card">
+      <h3>影音库（Emby · 可选）</h3>
+      <p class="d">填了才会检查。看的是 Emby 里最近一条入库离现在多久——
+        文件落了盘但 Emby 没扫到，你看到的还是旧的，所以只认 Emby 这一侧的账。</p>
+      <div class="row">
+        <div class="f"><label>Emby 地址</label>
+          <input id="embase" placeholder="http://host.docker.internal:8096">
+          <div class="hint">容器内访问宿主机用它；端口换成你自己 Emby 的</div></div>
+        <div class="f"><label>API 密钥</label>
+          <input id="emkey" type="password" placeholder="留空不修改">
+          <div class="hint" id="emKeyHint">Emby 后台 → 设置 → 高级 → API 密钥 → 新建</div></div>
+      </div>
+      <div class="row">
+        <div class="f"><label>断更阈值（小时）</label>
+          <input id="emstale" type="number" min="6" max="720" step="1" placeholder="36">
+          <div class="hint">最近一条入库超过这么久就报异常。每日同步一次，36 小时留了缓冲</div></div>
+        <div class="f" style="justify-content:flex-end">
+          <button class="btn" onclick="testEmby(this)">测试连接</button>
+          <div class="hint" id="emTest" style="min-height:18px"></div></div>
+      </div>
       <div style="margin-top:4px"><button class="btn pri" onclick="save(this)">保存设置</button></div>
     </div>
     <div class="card">
@@ -2059,6 +2246,7 @@ async function load(){
   S.provs=(r.detail_providers||[]);
   renderHero(r); renderProvs(r.detail_providers||[]); renderToggles(r.detail_providers||[]);
   renderSkip(r.skipped_groups||[]);
+  renderEmby(r.emby);
   if(!S.dirty && !editable(document.activeElement)) fillForms(S.conf);
   renderPreview();
   fetch('/api/stats').then(function(x){return x.json()}).then(function(st){
@@ -2106,6 +2294,8 @@ function renderHero(r){
     txt.textContent=bad+' 个网盘凭证失效'; }
   else if(warn){ hero.classList.add('s-warn'); pulse.className='pulse warn';
     txt.textContent='检测降级，结论需人工确认'; }
+  else if(r.emby && r.emby.ok===false){ hero.classList.add('s-bad'); pulse.className='pulse bad';
+    txt.textContent='影音库断更'; }
   else if(last.verdict==='OK'){ pulse.className='pulse';
     txt.textContent=(provs.length||'全部')+' 个网盘全部正常'; }
   else { pulse.className='pulse warn'; txt.textContent='结果：'+last.verdict; }
@@ -2137,6 +2327,8 @@ function heroSum(r,provs,bad,warn){
     return names.join('、')+' 需要处理：卡片上点「重测」可单独验证，点「去修复」直达 alist 存储管理。';
   }
   if(warn) return '有网盘的分享目录全部失效，但个人盘正常——多为上游取消分享，不一定要改凭证。';
+  if(r.emby && r.emby.ok===false)
+    return '影音库已经 '+ageTxt(r.emby.age_h)+'没有新增内容，每日同步大概没跑成功，值得看一眼。';
   var st=S.stats||{}, days=(st.incidents||{}).days||[], lastBad='';
   for(var i=days.length-1;i>=0;i--){ if(days[i].v==='FAIL'){ lastBad=days[i].d; break } }
   var ago='';
@@ -2211,6 +2403,49 @@ function renderProvs(provs){
       '<span class="pill '+st+'">'+label+'</span></div>'+
       '<div class="pv-m">'+lines.join('')+probe+'</div>'+detail+stripHtml+'</div>';
   }).join('');
+}
+
+/* 影音库：Emby 最近一次入库离现在多久，就是「每日更新有没有成功」的直接答案 */
+function ageTxt(h){
+  if(h==null) return '未知';
+  if(h<1) return '刚刚';
+  if(h<24) return Math.round(h)+' 小时前';
+  return (h/24).toFixed(1)+' 天前';
+}
+function renderEmby(em){
+  var box=$('embyBox'), card=$('embyCard'), hint=$('embyHint');
+  if(!box) return;
+  var base=((S.conf||{}).emby||{}).base||'';
+  if(!em && !base){ box.style.display='none'; return }
+  box.style.display='';
+  if(!em){
+    hint.textContent='';
+    var hasKey=((S.conf||{}).emby||{}).key_set;
+    card.innerHTML='<div class="card" style="grid-column:1/-1;color:var(--txt3)">'+
+      (hasKey?'已配置，等下一轮巡检出结果（或到设置里点「测试连接」）'
+             :'还差一个 API 密钥：到「连接与安全 → 影音库」里填上就能生效')+
+      '</div>';
+    return;
+  }
+  var bad=(em.ok===false);
+  var st=bad?'bad':'ok';
+  var label=bad?'断更':(em.ok===null?'未知':'正常');
+  var c=em.counts||{};
+  var rows=[];
+  rows.push('<div class="r"><span>最近入库</span><b>'+esc(ageTxt(em.age_h))+'</b></div>');
+  if(em.last_name)
+    rows.push('<div class="r"><span>最新条目</span><b title="'+esc(em.last_name)+'">'+
+      esc(em.last_name)+'</b></div>');
+  rows.push('<div class="r"><span>今日入库</span><b>'+(em.today||0)+' 集</b></div>');
+  rows.push('<div class="r"><span>库容量</span><b>'+(c.episode||0)+' 集 · '+
+    (c.movie||0)+' 部</b></div>');
+  var note=em.msg?('<div class="pv-d'+(bad?' warn':'')+'">'+esc(em.msg)+'</div>'):'';
+  var th=em.stale_h||36;
+  hint.textContent='超过 '+th+' 小时没有新增才算断更';
+  card.innerHTML='<div class="pv st-'+st+'" style="--c:#52b54b">'+
+    '<div class="pv-t"><span class="pv-n">Emby</span>'+
+    '<span class="pill '+(bad?'bad':'ok')+'">'+label+'</span></div>'+
+    '<div class="pv-m">'+rows.join('')+'</div>'+note+'</div>';
 }
 
 function renderStats(st){
@@ -2433,6 +2668,10 @@ function fillForms(c){
     $('hburl').value=((c.heartbeat||{}).url)||'';
   $('alist').value=c.alist_base||''; $('gbox').value=c.gbox_base||'';
   $('gu').value=c.gbox_user||''; $('adb').value=c.alist_db||'';
+  var em=c.emby||{};
+  $('embase').value=em.base||'';
+  $('emstale').value=em.stale_h||36;
+  if($('emKeyHint')&&em.key_set) $('emKeyHint').textContent='已保存密钥，留空表示不修改';
 }
 
 function collect(){
@@ -2451,9 +2690,36 @@ function collect(){
     heartbeat:{url:$('hburl').value.trim()},
     alist_base:$('alist').value.trim(),gbox_base:$('gbox').value.trim(),
     gbox_user:$('gu').value.trim(),alist_db:$('adb').value.trim(),
+    emby:embyBody(),
     disabled:Array.prototype.slice.call(document.querySelectorAll('#toggles .chip.off'))
       .map(function(e){return e.dataset.g})
   };
+}
+
+/* emby：密钥留空就不放进请求体，避免每次保存把已存的密钥清掉 */
+function embyBody(){
+  var o={base:$('embase').value.trim(),stale_h:+$('emstale').value||36};
+  var k=$('emkey').value.trim(); if(k) o.key=k;
+  return o;
+}
+
+async function testEmby(btn){
+  var el=$('emTest'); el.textContent='测试中…'; el.style.color='var(--txt3)';
+  if(btn) btn.disabled=true;
+  try{
+    var r=await fetch('/api/emby-test',{method:'POST',body:JSON.stringify(embyBody())})
+      .then(function(x){return x.json()});
+    var d=r.result||{};
+    if(r.ok){
+      el.style.color='var(--ok)';
+      el.textContent='连上了 · 最近入库 '+(d.age_h==null?'未知':(d.age_h<1?'刚刚':Math.round(d.age_h)+' 小时前'))+
+        ' · 今日 '+(d.today||0)+' 集';
+    }else{
+      el.style.color='var(--bad)';
+      el.textContent=d.msg||'连接失败';
+    }
+  }catch(e){ el.style.color='var(--bad)'; el.textContent='测试失败：'+e.message }
+  if(btn) btn.disabled=false;
 }
 
 async function save(btn){
@@ -2463,7 +2729,7 @@ async function save(btn){
   if(btn) btn.disabled=true;
   try{
     var r=await fetch('/api/save',{method:'POST',body:JSON.stringify(body)}).then(function(x){return x.json()});
-    if(r.ok){ clearDirty(); t('已保存'); $('gp').value=''; await load(); }
+    if(r.ok){ clearDirty(); t('已保存'); $('gp').value=''; $('emkey').value=''; await load(); }
     else t('保存失败');
   }catch(e){t('保存失败：'+e.message)}
   if(btn) btn.disabled=false;
@@ -2748,6 +3014,7 @@ class Handler(BaseHTTPRequestHandler):
                 phase = STATE["phase"]
             detail_providers = []
             skipped_groups = []
+            detail_emby = None
             if not last:
                 # 容器刚重启时内存里还没有结果，先用历史最后一轮顶上，
                 # 否则页面会短暂显示「首次检测」+ 全 0，看着像数据丢了
@@ -2771,6 +3038,7 @@ class Handler(BaseHTTPRequestHandler):
                         _d = json.loads(row[0]) or {}
                         detail_providers = _d.get("providers", [])
                         skipped_groups = _d.get("skipped_groups", [])
+                        detail_emby = _d.get("emby")
                 except Exception:
                     pass
             try:
@@ -2787,7 +3055,8 @@ class Handler(BaseHTTPRequestHandler):
                                     "pause_left": paused_left(),
                                     "host": host,
                                     "detail_providers": detail_providers,
-                                    "skipped_groups": skipped_groups})
+                                    "skipped_groups": skipped_groups,
+                                    "emby": detail_emby})
         if self.path == "/api/history":
             return self._send(200, {"items": hist_list(30)})
         if self.path == "/api/stats":
@@ -2857,6 +3126,24 @@ class Handler(BaseHTTPRequestHandler):
             if not g:
                 return self._send(400, {"ok": False, "msg": "缺少 group"})
             return self._send(200, probe_one(conf, g))
+        if path == "/api/emby-test":
+            # 设置页点「测试连接」：允许用还没保存的地址/密钥先试一下
+            c2 = load_conf()
+            e2 = dict(c2.get("emby") or {})
+            if str(body.get("base") or "").strip():
+                e2["base"] = str(body["base"]).strip()
+            if str(body.get("key") or "").strip():
+                e2["key"] = str(body["key"]).strip()
+            try:
+                e2["stale_h"] = float(body.get("stale_h") or e2.get("stale_h") or 36)
+            except Exception:
+                pass
+            c2["emby"] = e2
+            try:
+                r = check_emby(c2) or {"ok": False, "msg": "还没填地址或密钥"}
+            except Exception as ex:
+                r = {"ok": False, "msg": "出错：%s" % type(ex).__name__}
+            return self._send(200, {"ok": bool(r.get("ok")), "result": r})
         if path == "/api/run":
             # 立即返回，前端轮询 /api/state（一次巡检可能要一两分钟）
             started = start_run(conf, push=False)
@@ -2879,6 +3166,11 @@ class Handler(BaseHTTPRequestHandler):
             for k in ("schedule", "bark", "notify", "probe", "heartbeat"):
                 if isinstance(body.get(k), dict):
                     conf[k].update(body[k])
+            # emby 单独处理：key 留空表示「不修改」，否则每次保存都会把密钥清掉
+            if isinstance(body.get("emby"), dict):
+                em = {k: v for k, v in body["emby"].items()
+                      if not (k == "key" and not str(v or "").strip())}
+                conf["emby"].update(em)
             for k in ("notify_when_ok", "alist_base", "gbox_base", "gbox_user",
                       "gbox_pass", "ui_password", "alist_db", "public_base"):
                 if k in body and body[k] not in ("", None):
