@@ -1376,6 +1376,49 @@ def bark_push(conf, title, body, level="active", jump=""):
     return False, last
 
 
+def _compact_for_push(lines, detail):
+    """把逐条网盘行压成一行，别让影音库被挤出手机横幅。
+
+    iOS 的横幅只显示前几行，逐条列 6 个网盘正好占满——影音库那行排在第 7，
+    手机上根本看不到（用户反馈过：明明发了，通知里却没有）。
+    所以：异常行照旧逐条列（要看细节），正常的合并成「A · B · C 全部正常」。
+    """
+    provs = detail.get("providers") or []
+    st_of = {p.get("group"): p.get("status") for p in provs if p.get("group")}
+
+    def prov_of(ln):
+        for g in st_of:
+            emo = pmeta(g).get("emoji") or ""
+            if ln.startswith(emo + " " + g) or ln.startswith(g + " "):
+                return g
+        return None
+
+    bad, good, other = [], [], []
+    for ln in lines:
+        g = prov_of(ln)
+        if not g:
+            other.append(ln)
+        elif st_of.get(g) == "ok":
+            good.append((g, ln))
+        else:
+            bad.append(ln)
+
+    out = list(bad) + other
+    if good:
+        names = " · ".join(g for g, _ in good)
+        merged = ("✅ %s 全部正常" % names) if not bad \
+            else ("✅ 其余 %d 个网盘正常（%s）" % (len(good), names))
+        # 插在「问题：/注意：/建议：」段之前——否则合并行会落在问题清单中间，
+        # 看起来像清单没写完就跳到结论了
+        pos = len(out)
+        for i, ln in enumerate(out):
+            if ln.startswith(("问题：", "注意：", "建议：", "近期不稳", "老账")):
+                pos = i
+                break
+        out.insert(pos, merged)
+    return out
+
+
 def bark_render(conf, verdict, lines, detail=None, now=None, daily=None):
     """按用户配置的模板渲染推送内容，返回 (title, body, level)
     可用占位符：{date} {time} {verdict} {count} {bad}"
@@ -1395,7 +1438,7 @@ def bark_render(conf, verdict, lines, detail=None, now=None, daily=None):
             t = t.replace("{%s}" % k, v)
         return t
 
-    body = "\n".join(lines)
+    body = "\n".join(_compact_for_push(lines, detail))
     if verdict == "OK":
         title = fmt(b.get("title_ok") or "✅ 网盘正常 {date} {time}")
         level = b.get("level_ok") or "active"
@@ -4266,7 +4309,9 @@ class Handler(BaseHTTPRequestHandler):
             detail = hist_detail(rid) if rid else None
             lines = ["🔔 这是一条测试推送"]
             if last.get("lines"):
-                lines += [""] + list(last["lines"])[:6]
+                # 不再截 6 行：正文会被 _compact_for_push 压成几行，
+                # 截断反而会把影音库那行砍掉，测试就失去意义了
+                lines += list(last["lines"])[:12]
             # 按最近一次真实结论渲染，否则标题会跟实际状态打架
             title, body, level = bark_render(conf, last.get("verdict") or "OK",
                                              lines, detail, now)
