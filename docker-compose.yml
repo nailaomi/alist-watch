@@ -1,0 +1,23 @@
+services:
+  alist-watch:
+    build: .
+    image: alist-watch:1.0
+    container_name: alist-watch
+    restart: unless-stopped
+    ports:
+      # 左边是宿主机端口，按需修改
+      - "8099:8088"
+    extra_hosts:
+      # 容器内用 host.docker.internal 访问宿主机上的 alist / G-Box
+      - "host.docker.internal:host-gateway"
+    environment:
+      - DATA_DIR=/app/data
+      - PORT=8088
+    volumes:
+      # 本程序自己的配置与历史（可写）
+      - ./data:/app/data
+      # alist 的数据库目录，只读挂载 —— 程序绝不写入
+      # 改成你自己 alist 的 data.db 所在目录，例如：
+      #   - /volume1/docker/alist/data:/alist/data:ro
+      # 如果 alist 也跑在 docker 里，可以直接用它的命名卷
+      - /path/to/alist/data:/alist/data:ro

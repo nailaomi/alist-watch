@@ -1,0 +1,24 @@
+# 运行时数据 —— 内含你的配置、网盘信息和巡检历史，绝不能提交
+data/
+config.json
+runstate.json
+*.db
+*.sqlite
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# 编辑器与系统
+.DS_Store
+.vscode/
+.idea/
+*.swp
+
+# 打包与本地备份
+*.bak
+*.bak-*
+*.tar.gz
+dist/
