@@ -1,0 +1,38 @@
+name: Create Release
+
+# 每次推 v* 标签，就用仓库里的 RELEASE_NOTES.md 生成一条正式 Release。
+# 第一行是 Release 标题，第三行起是正文——发布内容跟着代码一起进版本库，
+# 不用再靠接口临时传一段容易写漏的说明。
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Publish release notes
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Check release notes
+        run: |
+          test -s RELEASE_NOTES.md || { echo "RELEASE_NOTES.md 是空的"; exit 1; }
+
+      - name: Split title and body
+        id: notes
+        run: |
+          title="$(head -n 1 RELEASE_NOTES.md)"
+          test -n "$title" || { echo "RELEASE_NOTES.md 第一行不能为空"; exit 1; }
+          printf 'title=%s\n' "$title" >> "$GITHUB_OUTPUT"
+          tail -n +3 RELEASE_NOTES.md > release-body.md
+
+      - name: Create or update release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: ${{ steps.notes.outputs.title }}
+          body_path: release-body.md

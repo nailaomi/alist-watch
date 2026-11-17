@@ -788,7 +788,7 @@ def _xyemd_find(conf, rs):
 
 
 def _xyemd_show(rel):
-    """从 综艺/国内综艺/花儿与少年 (2014)/Season 8/xxx.strm 里取出「花儿与少年 (2014)」。"""
+    """从 综艺/国内综艺/某综艺 (2014)/Season 8/xxx.strm 里取出「某综艺 (2014)」。"""
     parts = [p for p in rel.split("/") if p]
     for i, seg in enumerate(parts):
         if XY_SEASON.search(seg) and i:
@@ -902,6 +902,23 @@ def check_xyemd(conf, rs):
     else:
         r["ok"] = True
     return r
+
+
+def _xyemd_should_alert(xym, chronic):
+    """同步失败是否值得报警。
+
+    同一个剧集连续缺下去，用户往往根本没法解决（上游 403、源被删），
+    再报只会天天响同一个铃。所以：失败全部来自「已经连缺 >=2 天」的老账
+    时不报警；但只要夹着一个新缺的集，就照常报——不能被老账掩盖。
+    与缺集无关的失败（同步没跑、没跑完、读日志出错）missing 为空，照常报。
+    """
+    if xym.get("ok") is not False:
+        return False
+    pairs = {(s, e) for s, es in (xym.get("missing") or {}).items() for e in es}
+    if not pairs:
+        return True
+    old = {(i.get("show"), i.get("ep")) for i in (chronic or [])}
+    return bool(pairs - old)
 
 
 # ---------------------------------------------------------------- 播放链路
@@ -1233,9 +1250,8 @@ def check_once(conf):
         except Exception as e:
             log("空转检测出错：", e)
         detail["xyemd"] = xym
-        if xym.get("ok") is False:
-            issues.append("每日同步：" + (xym.get("msg") or "异常"))
-        # 缺集连续天数：单天新缺不打扰，连续多天才在推送里点名
+        # 缺集连续天数：先算出来，判定时要用（第 1 天新缺报，第 2 天起不报）
+        chronic = []
         if xym.get("missing"):
             try:
                 _missing_track(rs, xym)
@@ -1249,6 +1265,12 @@ def check_once(conf):
         elif rs.get("missing_track"):
             rs["missing_track"] = {}          # 补齐了，清掉旧账
             save_runstate(rs)
+        if _xyemd_should_alert(xym, chronic):
+            issues.append("每日同步：" + (xym.get("msg") or "异常"))
+        elif xym.get("ok") is False:
+            # 仍是真的失败（页面继续显示），只是不值得再推送打扰
+            log("同步失败全部来自连缺 >=2 天的老账，不判异常：%s"
+                % (xym.get("msg") or ""))
 
     # 5b) 影音库（可选）：昨天那轮同步成没成
     set_phase("检查影音库更新")
@@ -1453,7 +1475,15 @@ def bark_render(conf, verdict, lines, detail=None, now=None, daily=None):
         title = "⚠️ 巡检降级（结论不可信）"
         level = "active"
     else:
-        title = fmt(b.get("title_bad") or "⛔ {bad} 需要处理")
+        # 标题得说准：网盘全绿、只是同步挂了，就不能叫「网盘凭证异常」
+        bad_prov = [i for i in (detail.get("providers") or [])
+                    if i.get("status") == "bad"]
+        if bad_prov:
+            title = fmt(b.get("title_bad") or "⛔ {bad} 需要处理")
+        elif (detail.get("xyemd") or {}).get("ok") is False:
+            title = "⛔ 影音库同步异常"
+        else:
+            title = "⛔ 巡检异常"
         level = b.get("level_bad") or "timeSensitive"
         if b.get("with_hint", True):
             hint = _fix_hint(conf, detail)
@@ -1464,8 +1494,10 @@ def bark_render(conf, verdict, lines, detail=None, now=None, daily=None):
         body += "\n\n近期不稳：" + "、".join(
             "%s %d/%d 轮失败" % (g, v.get("fail", 0), v.get("tot", 0))
             for g, v in sorted(fl.items()))
-    # 连续多天缺同一集：单天新缺不报，连续 >=2 天才值得动手换源
-    ch = detail.get("missing_chronic") or []
+    # 老账只在第 2 天提一次：第 1 天强提醒，第 3 天起彻底不写进推送——
+    # 上游 403 这种事用户已经知道、也解决不了，天天写同一句只会烦人。
+    ch = [i for i in (detail.get("missing_chronic") or [])
+          if int(i.get("days") or 0) == 2]
     if ch:
         body += "\n\n老账：" + "、".join(
             "%s %s 已缺 %d 天" % (i["show"], i["ep"], i["days"]) for i in ch[:3])
