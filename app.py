@@ -43,8 +43,8 @@ DEFAULT_CONF = {
     "gbox_pass": "",
     "alist_db": "/alist/data/data.db",
     "bark": {"url": "", "key": "", "group": "NAS巡检", "sound": "minuet",
-             "title_ok": "✅ 网盘正常 {date} {time}",
-             "title_bad": "⛔ {bad} 需要处理",
+             "title_ok": "✅ 一切正常",
+             "title_bad": "⛔ 巡检异常 {bad}",
              "level_ok": "active",
              "level_bad": "timeSensitive", "with_hint": True},
     # 夜间静音窗口：凌晨出事也修不了，先别响铃，进通知中心早上再看。
@@ -1407,19 +1407,27 @@ def push_groups(detail):
     """
     d = detail or {}
     provs = [p for p in (d.get("providers") or []) if p.get("status") != "off"]
-    badp = [p for p in provs if p.get("status") != "ok"]
+    badp = [p for p in provs if p.get("status") == "bad"]
+    warnp = [p for p in provs if p.get("status") == "warn"]
 
     # ---- 网盘：凭证 / 分享 / 实测 三个小类
     net = []
     if badp:
-        for p in badp[:3]:
+        # 异常盘全部列出，不截断——标题已按全部坏盘生成，正文若只列前 3 个，
+        # 第 4 个起会凭空消失，还被"其余 N 个正常"误算进去，标题正文自相矛盾。
+        # 正常场景才需要压缩，异常时准确性优先。
+        for p in badp:
             net.append("凭证：%s %s" % (p.get("group") or "?",
-                                     (p.get("detail") or "凭证失效")[:26]))
+                                     (p.get("detail") or "鉴权失效")[:26]))
         rest = len(provs) - len(badp)
         if rest:
             net.append("其余 %d 个凭证正常" % rest)
     else:
         net.append("凭证：%d 个全部正常" % len(provs) if provs else "凭证：未配置")
+    if warnp:
+        # 分享全失效≠凭证失效，采集层只是 warn，单独说清楚、不混进凭证行
+        net.append("分享全失效：" + "、".join(
+            (p.get("group") or "?") for p in warnp))
 
     low = [p for p in provs
            if p.get("share_total") and (p.get("share_work") or 0) < p.get("share_total")]
@@ -1430,13 +1438,20 @@ def push_groups(detail):
     else:
         net.append("分享：全部可用")
 
-    probed = [p for p in provs if p.get("probe")]
-    pbad = [p for p in probed if p.get("probe") != "ok"]
+    # 只有 bad（命中鉴权关键字、真失效）才算实测失败。
+    # unknown=没测出结论、off=关了实测、cached=复用——都不该让网盘大类误报异常，
+    # 采集层对它们也只记 warn 不记 issue。历史轮次 23 就因 unknown 被误报成失败。
+    probed = [p for p in provs if p.get("probe") in ("ok", "bad", "unknown")]
+    pbad = [p for p in probed if p.get("probe") == "bad"]
+    punk = [p for p in probed if p.get("probe") == "unknown"]
     if pbad:
-        net.append("实测：%s 失败" % "、".join(p.get("group") or "?" for p in pbad[:3]))
-    elif probed:
+        net.append("实测：%s 未通过" % "、".join(p.get("group") or "?" for p in pbad[:3]))
+    if punk:
+        net.append("实测未定：%s（字段待确认）" % "、".join(
+            p.get("group") or "?" for p in punk[:3]))
+    if not pbad and not punk and probed:
         net.append("实测：%d 个通过" % len(probed))
-    else:
+    if not probed:
         net.append("实测：本轮复用")
 
     # ---- 同步：成功率 / 缺集 / 入库 / 播放 四个小类
@@ -1509,9 +1524,11 @@ def bark_render(conf, verdict, lines, detail=None, now=None, daily=None):
     detail = detail or {}
     bad_groups = [i.get("group") for i in detail.get("providers", [])
                   if i.get("status") == "bad"]
+    # {bad} 只放真实坏掉的网盘名；没有坏盘时留空，让模板自己说清楚
+    # （默认「⛔ 巡检异常 {bad}」无坏盘时读成「⛔ 巡检异常」，不再硬塞「网盘」二字）。
     subs = {"date": now.strftime("%m-%d"), "time": now.strftime("%H:%M"),
             "verdict": verdict, "count": str(len(bad_groups)),
-            "bad": "、".join(bad_groups) if bad_groups else "网盘"}
+            "bad": "、".join(bad_groups)}
 
     def fmt(t):
         for k, v in subs.items():
@@ -1523,7 +1540,7 @@ def bark_render(conf, verdict, lines, detail=None, now=None, daily=None):
     if lines and str(lines[0]).startswith("🔔"):
         body = str(lines[0]) + "\n" + body
     if verdict == "OK":
-        title = fmt(b.get("title_ok") or "✅ 网盘正常 {date} {time}")
+        title = fmt(b.get("title_ok") or "✅ 一切正常")
         level = b.get("level_ok") or "active"
         if daily:
             r = (daily.get("rounds") or {})
@@ -1536,15 +1553,10 @@ def bark_render(conf, verdict, lines, detail=None, now=None, daily=None):
         title = "⚠️ 巡检降级（结论不可信）"
         level = "active"
     else:
-        # 标题得说准：网盘全绿、只是同步挂了，就不能叫「网盘凭证异常」
-        bad_prov = [i for i in (detail.get("providers") or [])
-                    if i.get("status") == "bad"]
-        if bad_prov:
-            title = fmt(b.get("title_bad") or "⛔ {bad} 需要处理")
-        elif (detail.get("xyemd") or {}).get("ok") is False:
-            title = "⛔ 影音库同步异常"
-        else:
-            title = "⛔ 巡检异常"
+        # 折中方案：异常统一用「⛔ 巡检异常 {bad}」——有坏盘就带上名字，
+        # 纯同步/播放异常时 {bad} 为空，读成「⛔ 巡检异常」，不再片面地叫
+        # 「网盘凭证异常」，也不再为每种原因硬编码一个标题分叉。
+        title = fmt(b.get("title_bad") or "⛔ 巡检异常 {bad}").strip()
         level = b.get("level_bad") or "timeSensitive"
         if b.get("with_hint", True):
             hint = _fix_hint(conf, detail)
@@ -2504,6 +2516,10 @@ color:#111}
 .notif p{margin:0;font-size:0.75rem;color:#4b5563;white-space:pre-wrap;line-height:1.45;
 max-height:176px;overflow:auto}
 .ph-hint{text-align:center;color:rgba(255,255,255,.4);font-size:0.6562rem;margin-top:12px}
+.ph-label{text-align:center;color:rgba(255,255,255,.78);font-size:0.6875rem;font-weight:600;
+margin:0 0 8px;letter-spacing:.02em}
+.phones{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}
+.phones .phone{position:static;min-width:0}
 
 /* history */
 .tbl{overflow-x:auto;-webkit-overflow-scrolling:touch}
@@ -2575,6 +2591,7 @@ tr.clk:hover td{background:var(--surf2)}
 @media(max-width:820px){
 .notify-wrap{grid-template-columns:1fr}
 .phone{position:static;max-width:300px;margin:0 auto}
+.phones{grid-template-columns:1fr;max-width:300px;margin:0 auto}
 .hero{flex-direction:column;align-items:flex-start;gap:16px}
 .hero-r{width:100%}
 .stat{flex:1;min-width:0}
@@ -2761,35 +2778,49 @@ th:nth-child(3),td:nth-child(3){min-width:180px}
               </select></div>
           </div>
           <div class="f"><label>正常时的标题模板</label>
-            <input id="btok" placeholder="✅ 网盘正常 {date} {time}" oninput="renderPreview()">
-            <div class="hint">占位符：<code>{date}</code> 日期、<code>{time}</code> 时间、<code>{count}</code> 异常数。
-              一天 3 条，建议带上 <code>{time}</code>，通知中心里一眼分清早中晚。</div></div>
+            <input id="btok" placeholder="✅ 一切正常" oninput="renderPreview()">
+            <div class="hint">占位符：<code>{date}</code> 日期、<code>{time}</code> 时间。
+              标题建议短、只给结论；时间已放在正文与通知副标题，不必堆在标题里。</div></div>
           <div class="f"><label>异常时的标题模板</label>
-            <input id="btbad" placeholder="⛔ 网盘凭证异常" oninput="renderPreview()">
-            <div class="hint">可用 <code>{bad}</code> 自动列出出问题的网盘名，如「⛔ {bad} 凭证失效」</div></div>          <div class="f"><label>异常时附带修复建议</label>
+            <input id="btbad" placeholder="⛔ 巡检异常 {bad}" oninput="renderPreview()">
+            <div class="hint"><code>{bad}</code> 自动填出问题的网盘名；纯同步/播放异常时留空，读成「⛔ 巡检异常」。</div></div>
+          <div class="f"><label>异常时附带修复建议</label>
             <select id="bhint" onchange="renderPreview()">
               <option value="1">是（正文末尾加「建议：…」）</option>
               <option value="0">否（只发结果）</option>
             </select></div>
         </div>
-        <div class="phone">
-          <div class="bar-top"></div>
-          <div class="notif">
-            <div class="notif-t"><span id="pvGroup">NAS巡检</span>
-              <span class="tm">现在</span></div>
-            <h4 id="pvTitle">✅ 网盘正常 11-16 12:30</h4>
-            <p id="pvBody">📦 115 ✅ 实测通过｜分享 206/206
-⚛️ 夸克 ✅ 实测通过｜分享 42/65
-🦆 光鸭 ✅ 实测通过
-☁️ 阿里 ✅ 实测通过</p>
+        <div class="phones">
+          <div>
+            <div class="ph-label">全部正常时</div>
+            <div class="phone">
+              <div class="bar-top"></div>
+              <div class="notif">
+                <div class="notif-t"><span class="pv-g">NAS巡检</span>
+                  <span class="tm">现在</span></div>
+                <h4 id="pvTitleOk">✅ 一切正常</h4>
+                <p id="pvBodyOk"></p>
+              </div>
+            </div>
           </div>
-          <div class="ph-hint">实时预览 · 改模板立即生效</div>
+          <div>
+            <div class="ph-label">有异常时</div>
+            <div class="phone">
+              <div class="bar-top"></div>
+              <div class="notif">
+                <div class="notif-t"><span class="pv-g">NAS巡检</span>
+                  <span class="tm">现在</span></div>
+                <h4 id="pvTitleBad">⛔ 巡检异常 夸克</h4>
+                <p id="pvBodyBad"></p>
+              </div>
+            </div>
+          </div>
         </div>
       </div>
       <div style="margin-top:6px;display:flex;gap:9px;flex-wrap:wrap">
         <button class="btn" onclick="testPush(this)">发一条测试</button>
-        <button class="btn" onclick="switchTab('notify');previewBad()">预览异常样式</button>
       </div>
+      <div class="ph-hint" style="color:var(--muted)">两个样式常驻对比，改模板立即生效。异常方块只是示意，实际内容随巡检结果变化。</div>
       <div class="blkbar">
         <button class="btn pri sm" onclick="saveBlock('bark',this)">保存</button>
         <span class="blkst" id="st-bark"></span>
@@ -3236,7 +3267,7 @@ function fmtTpl(tpl,verdict,badList){
     time:p2(d.getHours())+':'+p2(d.getMinutes()),
     verdict:verdict||'OK',
     count:String((badList||[]).length),
-    bad:(badList&&badList.length)?badList.join('、'):'网盘'};
+    bad:(badList||[]).join('、')};
   return (tpl||'').replace(/\{(date|time|verdict|count|bad)\}/g,function(_,k){return subs[k]});
 }
 // 预览和真机推送共用后端给的分组数据，不再由前端另拼一套。
@@ -3251,29 +3282,32 @@ function fmtGroups(pg){
   (pg.notes||[]).forEach(function(n){out.push('  ! '+n)});
   return out.join('\n');
 }
-function previewBad(){
-  var pg=JSON.parse(JSON.stringify(S.pushGroups||
-    {net:{ok:true,items:[]},sync:{ok:true,items:[]},notes:[]}));
-  var first=S.provs.length?S.provs[0].group:'115';
-  pg.net.ok=false; pg.net.items.unshift('凭证：'+first+' cookie 已失效');
-  pg.sync.ok=false; pg.sync.items.unshift('成功率：89.3%（失败 3 个）');
-  renderPreview('FAIL',null,[first],pg);
-}
-function renderPreview(verdictOverride,linesOverride,badOverride,groupsOverride){
-  var g=($('bgroup').value||'NAS巡检').trim();
-  $('pvGroup').textContent=g;
-  var ver=verdictOverride||(S.last&&S.last.verdict)||'OK';
-  var bads=badOverride||S.provs.filter(function(p){return p.status==='bad'}).map(function(p){return p.group});
-  var tpl=ver==='OK'?($('btok').value||'✅ 网盘正常 {date} {time}'):($('btbad').value||'⛔ {bad} 需要处理');
-  $('pvTitle').textContent = ver==='WARN' ? '⚠️ 巡检降级（结论不可信）' : fmtTpl(tpl,ver,bads);
-  var pg=groupsOverride||S.pushGroups;
-  var body=pg?fmtGroups(pg):
-    (linesOverride||(S.last&&S.last.lines)||[]).slice(0,8).join('\n');
-  if(ver!=='OK' && $('bhint').value==='1'){
-    var pri=bads.length?'需重新授权/重填 cookie':'';
-    body+='\n\n建议：'+pri;
-  }
-  $('pvBody').textContent=body;
+function renderPreview(){
+  var grp=($('bgroup')&&$('bgroup').value||'NAS巡检').trim()||'NAS巡检';
+  var gs=document.querySelectorAll('.pv-g');
+  for(var i=0;i<gs.length;i++) gs[i].textContent=grp;
+  var first=(S.provs&&S.provs.length)?S.provs[0].group:'115';
+  var src=S.pushGroups||{net:{ok:true,items:['凭证：6 个全部正常','分享：全部可用','实测：6 个通过']},
+                              sync:{ok:true,items:['成功率：99.2%','缺集：无','播放：正常']},notes:[]};
+
+  // 左：全部正常——用真实分组数据，但把两类状态都当正常展示样式本身
+  var okTpl=($('btok')&&$('btok').value||'✅ 一切正常');
+  $('pvTitleOk').textContent=fmtTpl(okTpl,'OK',[]);
+  var okG=JSON.parse(JSON.stringify(src)); okG.net.ok=true; okG.sync.ok=true; okG.notes=[];
+  $('pvBodyOk').textContent=fmtGroups(okG);
+
+  // 右：有异常——复制一份翻转状态，塞一条坏盘 + 同步异常示意
+  var badTpl=($('btbad')&&$('btbad').value||'⛔ 巡检异常 {bad}');
+  $('pvTitleBad').textContent=fmtTpl(badTpl,'FAIL',[first]);
+  var bg=JSON.parse(JSON.stringify(src));
+  bg.net.ok=false; bg.sync.ok=false; bg.notes=[];
+  bg.net.items=['凭证：'+first+' cookie 已失效'].concat(
+    (bg.net.items||[]).filter(function(x){return x.indexOf('凭证')!==0}).slice(0,1));
+  bg.sync.items=['成功率：89.3%（失败 3 个）'].concat(
+    (bg.sync.items||[]).filter(function(x){return x.indexOf('成功率')!==0}).slice(0,2));
+  var badBody=fmtGroups(bg);
+  if($('bhint')&&$('bhint').value==='1') badBody+='\n\n建议：需重新授权/重填 cookie';
+  $('pvBodyBad').textContent=badBody;
 }
 /* ---------- 加载 ---------- */
 /* Bark 是这套系统唯一的通知出口，它自己坏了是最阴的故障：
@@ -3843,8 +3877,8 @@ function fillForms(c){
   var opt=Array.prototype.slice.call($('bsound').options).map(function(o){return o.value});
   $('bsound').value=opt.indexOf(snd)>=0?snd:'minuet';
   $('blevel').value=b.level_ok||'active';
-  $('btok').value=b.title_ok||'✅ 网盘正常 {date} {time}';
-  $('btbad').value=b.title_bad||'⛔ {bad} 需要处理';
+  $('btok').value=b.title_ok||'✅ 一切正常';
+  $('btbad').value=b.title_bad||'⛔ 巡检异常 {bad}';
   $('bhint').value=(b.with_hint===false?'0':'1');
   var pb=c.probe||{};
   $('pon').value=(pb.enabled===false?'0':'1');
