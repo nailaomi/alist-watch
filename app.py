@@ -1398,46 +1398,104 @@ def bark_push(conf, title, body, level="active", jump=""):
     return False, last
 
 
-def _compact_for_push(lines, detail):
-    """把逐条网盘行压成一行，别让影音库被挤出手机横幅。
+def push_groups(detail):
+    """把一轮巡检拆成「网盘」「同步」两大类，每类下面再分小类。
 
-    iOS 的横幅只显示前几行，逐条列 6 个网盘正好占满——影音库那行排在第 7，
-    手机上根本看不到（用户反馈过：明明发了，通知里却没有）。
-    所以：异常行照旧逐条列（要看细节），正常的合并成「A · B · C 全部正常」。
+    返回 {net:{ok,items}, sync:{ok,items}, notes:[...]}。
+    推送正文和网页实时预览共用这一份结果——以前预览是前端另拼的，
+    两边逻辑不一致，影音库那行就曾在真机里消失过。
     """
-    provs = detail.get("providers") or []
-    st_of = {p.get("group"): p.get("status") for p in provs if p.get("group")}
+    d = detail or {}
+    provs = [p for p in (d.get("providers") or []) if p.get("status") != "off"]
+    badp = [p for p in provs if p.get("status") != "ok"]
 
-    def prov_of(ln):
-        for g in st_of:
-            emo = pmeta(g).get("emoji") or ""
-            if ln.startswith(emo + " " + g) or ln.startswith(g + " "):
-                return g
-        return None
+    # ---- 网盘：凭证 / 分享 / 实测 三个小类
+    net = []
+    if badp:
+        for p in badp[:3]:
+            net.append("凭证：%s %s" % (p.get("group") or "?",
+                                     (p.get("detail") or "凭证失效")[:26]))
+        rest = len(provs) - len(badp)
+        if rest:
+            net.append("其余 %d 个凭证正常" % rest)
+    else:
+        net.append("凭证：%d 个全部正常" % len(provs) if provs else "凭证：未配置")
 
-    bad, good, other = [], [], []
-    for ln in lines:
-        g = prov_of(ln)
-        if not g:
-            other.append(ln)
-        elif st_of.get(g) == "ok":
-            good.append((g, ln))
+    low = [p for p in provs
+           if p.get("share_total") and (p.get("share_work") or 0) < p.get("share_total")]
+    if low:
+        net.append("分享：" + "、".join(
+            "%s %s/%s" % (p.get("group"), p.get("share_work"), p.get("share_total"))
+            for p in low[:3]))
+    else:
+        net.append("分享：全部可用")
+
+    probed = [p for p in provs if p.get("probe")]
+    pbad = [p for p in probed if p.get("probe") != "ok"]
+    if pbad:
+        net.append("实测：%s 失败" % "、".join(p.get("group") or "?" for p in pbad[:3]))
+    elif probed:
+        net.append("实测：%d 个通过" % len(probed))
+    else:
+        net.append("实测：本轮复用")
+
+    # ---- 同步：成功率 / 缺集 / 入库 / 播放 四个小类
+    sync = []
+    xym = d.get("xyemd") or {}
+    if xym:
+        pct = xym.get("pct")
+        if pct is not None:
+            sync.append("成功率：%.1f%%（失败 %s 个）" % (pct, xym.get("fail") or 0))
         else:
-            bad.append(ln)
+            sync.append("成功率：" + (xym.get("msg") or "读不出"))
+        eps = xym.get("missing_eps") or 0
+        if eps:
+            ch = xym.get("missing_chronic") or []
+            tail = ""
+            if ch:
+                tail = "（已缺 %d 天）" % max(int(i.get("days") or 0) for i in ch)
+            sync.append("缺集：%d 集%s" % (eps, tail))
+        else:
+            sync.append("缺集：无")
 
-    out = list(bad) + other
-    if good:
-        names = " · ".join(g for g, _ in good)
-        merged = ("✅ %s 全部正常" % names) if not bad \
-            else ("✅ 其余 %d 个网盘正常（%s）" % (len(good), names))
-        # 插在「问题：/注意：/建议：」段之前——否则合并行会落在问题清单中间，
-        # 看起来像清单没写完就跳到结论了
-        pos = len(out)
-        for i, ln in enumerate(out):
-            if ln.startswith(("问题：", "注意：", "建议：", "近期不稳", "老账")):
-                pos = i
-                break
-        out.insert(pos, merged)
+    emb = d.get("emby") or {}
+    if emb:
+        if emb.get("ok"):
+            sync.append("入库：%s 小时前" % emb.get("age_h"))
+        else:
+            sync.append("入库：" + (emb.get("msg") or "断更"))
+    play = d.get("play") or {}
+    if play:
+        sync.append("播放：" + ("正常" if play.get("ok") else
+                              (play.get("msg") or "不可播")))
+
+    net_ok = not badp and not pbad
+    sync_ok = (xym.get("ok") is not False and emb.get("ok") is not False
+               and play.get("ok") is not False)
+    for issue in (d.get("issues") or []):
+        if "同步" in str(issue) or "空转" in str(issue):
+            sync_ok = False
+        else:
+            net_ok = False
+    # 成功率小类已经把「本轮只成功 X%」说清楚了，别再在末尾重复一遍
+    notes = [str(i) for i in (d.get("issues") or [])
+             if not re.match(r"每日同步：本轮只成功 [\d.]+%（失败 \d+ 个文件）$",
+                             str(i))]
+    return {"net": {"ok": net_ok, "items": net},
+            "sync": {"ok": sync_ok, "items": sync},
+            "notes": notes}
+
+
+def groups_body(g):
+    """把分组数据画成 Bark 正文：大类一行，小类缩进一行。"""
+    out = []
+    for key, label in (("net", "网盘"), ("sync", "同步")):
+        part = g.get(key) or {}
+        out.append("【%s】%s %s" % (label, "✅" if part.get("ok") else "❌",
+                                  "正常" if part.get("ok") else "异常"))
+        out.extend("  · " + str(x) for x in (part.get("items") or []))
+    for n in (g.get("notes") or []):
+        out.append("  ! " + n)
     return out
 
 
@@ -1460,7 +1518,10 @@ def bark_render(conf, verdict, lines, detail=None, now=None, daily=None):
             t = t.replace("{%s}" % k, v)
         return t
 
-    body = "\n".join(_compact_for_push(lines, detail))
+    groups = push_groups(detail)
+    body = "\n".join(groups_body(groups))
+    if lines and str(lines[0]).startswith("🔔"):
+        body = str(lines[0]) + "\n" + body
     if verdict == "OK":
         title = fmt(b.get("title_ok") or "✅ 网盘正常 {date} {time}")
         level = b.get("level_ok") or "active"
@@ -3178,38 +3239,36 @@ function fmtTpl(tpl,verdict,badList){
     bad:(badList&&badList.length)?badList.join('、'):'网盘'};
   return (tpl||'').replace(/\{(date|time|verdict|count|bad)\}/g,function(_,k){return subs[k]});
 }
-function previewBad(){
-  var lines=(S.last&&S.last.lines)||[];
-  var fake=lines.slice(0,6);
-  var first=S.provs.length?S.provs[0].group:'115';
-  fake[0]=pemoji(first)+' '+first+' ❌ cookie 已失效';
-  renderPreview('FAIL',fake.slice(0,6),[first]);
+// 预览和真机推送共用后端给的分组数据，不再由前端另拼一套。
+function fmtGroups(pg){
+  if(!pg) return '';
+  var out=[];
+  [['net','网盘'],['sync','同步']].forEach(function(pair){
+    var p=pg[pair[0]]||{}, ok=!!p.ok;
+    out.push('【'+pair[1]+'】'+(ok?'✅':'❌')+' '+(ok?'正常':'异常'));
+    (p.items||[]).forEach(function(x){out.push('  · '+x)});
+  });
+  (pg.notes||[]).forEach(function(n){out.push('  ! '+n)});
+  return out.join('\n');
 }
-function renderPreview(verdictOverride,linesOverride,badOverride){
+function previewBad(){
+  var pg=JSON.parse(JSON.stringify(S.pushGroups||
+    {net:{ok:true,items:[]},sync:{ok:true,items:[]},notes:[]}));
+  var first=S.provs.length?S.provs[0].group:'115';
+  pg.net.ok=false; pg.net.items.unshift('凭证：'+first+' cookie 已失效');
+  pg.sync.ok=false; pg.sync.items.unshift('成功率：89.3%（失败 3 个）');
+  renderPreview('FAIL',null,[first],pg);
+}
+function renderPreview(verdictOverride,linesOverride,badOverride,groupsOverride){
   var g=($('bgroup').value||'NAS巡检').trim();
   $('pvGroup').textContent=g;
   var ver=verdictOverride||(S.last&&S.last.verdict)||'OK';
-  var lines=linesOverride||(S.last&&S.last.lines)||
-    ['📦 115 ✅ 实测通过｜分享 206/206','⚛️ 夸克 ✅ 实测通过｜分享 42/65',
-     '🦆 光鸭 ✅ 实测通过','☁️ 阿里 ✅ 实测通过'];
-  var seen={},keep=[];
-  lines.forEach(function(l){
-    var s=String(l).trim();
-    if(/^(注意|问题|建议)[：:]/.test(s))return;
-    var nm=null;
-    for(var i=0;i<S.provs.length;i++){
-      if(s.indexOf(S.provs[i].group)>=0){nm=S.provs[i].group;break}
-    }
-    if(nm){ if(seen[nm])return; seen[nm]=1 }
-    keep.push(s);
-  });
-  // 预览按真实推送全文画：6 个网盘 + 影音库 + 状况行，默认 8 行装得下。
-  // 之前截到 6 行，影音库那行正好被砍掉，看着像推送里没它。
-  lines=keep.slice(0,8);
   var bads=badOverride||S.provs.filter(function(p){return p.status==='bad'}).map(function(p){return p.group});
   var tpl=ver==='OK'?($('btok').value||'✅ 网盘正常 {date} {time}'):($('btbad').value||'⛔ {bad} 需要处理');
   $('pvTitle').textContent = ver==='WARN' ? '⚠️ 巡检降级（结论不可信）' : fmtTpl(tpl,ver,bads);
-  var body=lines.join('\n');
+  var pg=groupsOverride||S.pushGroups;
+  var body=pg?fmtGroups(pg):
+    (linesOverride||(S.last&&S.last.lines)||[]).slice(0,8).join('\n');
   if(ver!=='OK' && $('bhint').value==='1'){
     var pri=bads.length?'需重新授权/重填 cookie':'';
     body+='\n\n建议：'+pri;
@@ -3236,7 +3295,7 @@ async function load(){
       return x.json()}); }catch(e){ return }
   if(!r) return;
   S.conf=r.config||{}; S.last=r.last; S.nextTs=r.next_run_ts||0;
-  S.provs=(r.detail_providers||[]);
+  S.provs=(r.detail_providers||[]); S.pushGroups=r.push_groups||null;
   renderHero(r); renderProvs(r.detail_providers||[]); renderToggles(r.detail_providers||[]);
   renderSkip(r.skipped_groups||[]);
   renderEmby(r.xyemd, r.emby, r.play);
@@ -4195,6 +4254,7 @@ class Handler(BaseHTTPRequestHandler):
             detail_emby = None
             detail_play = None
             detail_xyemd = None
+            push_groups_data = None
             if not last:
                 # 容器刚重启时内存里还没有结果，先用历史最后一轮顶上，
                 # 否则页面会短暂显示「首次检测」+ 全 0，看着像数据丢了
@@ -4221,6 +4281,7 @@ class Handler(BaseHTTPRequestHandler):
                         detail_emby = _d.get("emby")
                         detail_play = _d.get("play")
                         detail_xyemd = _d.get("xyemd")
+                        push_groups_data = push_groups(_d)
                 except Exception:
                     pass
             try:
@@ -4241,6 +4302,7 @@ class Handler(BaseHTTPRequestHandler):
                                     "emby": detail_emby,
                                     "xyemd": detail_xyemd,
                                     "play": detail_play,
+                                    "push_groups": push_groups_data,
                                     "push_health": _push_health_state()})
         if self.path == "/api/history":
             return self._send(200, {"items": hist_list(30)})
