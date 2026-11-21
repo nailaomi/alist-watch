@@ -22,6 +22,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
+from contextlib import closing
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, quote, urlparse
@@ -148,7 +149,22 @@ def set_phase(txt):
 
 
 # ---------------------------------------------------------------- 配置
+# 每个 HTTP 请求都要读一次配置，而它几乎从不变。按 (mtime, size) 缓存，
+# 命中时只做一次深拷贝返回——调用方随便改返回值也不会污染缓存。
+_conf_cache = {"sig": None, "conf": None}
+_conf_lock = threading.Lock()
+
+
 def load_conf():
+    try:
+        st = os.stat(CONF_PATH)
+        sig = (st.st_mtime_ns, st.st_size)
+    except Exception:
+        sig = None
+    if sig is not None:
+        with _conf_lock:
+            if _conf_cache["sig"] == sig and _conf_cache["conf"] is not None:
+                return json.loads(json.dumps(_conf_cache["conf"]))
     c = json.loads(json.dumps(DEFAULT_CONF))
     try:
         with open(CONF_PATH, encoding="utf-8") as f:
@@ -160,6 +176,10 @@ def load_conf():
                 c[k] = v
     except Exception:
         pass
+    if sig is not None:
+        with _conf_lock:
+            _conf_cache["sig"] = sig
+            _conf_cache["conf"] = c
     return c
 
 
@@ -169,6 +189,9 @@ def save_conf(c):
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(c, f, ensure_ascii=False, indent=2)
     os.replace(tmp, CONF_PATH)
+    with _conf_lock:                    # 写盘后立刻让缓存放空，不依赖 mtime 精度
+        _conf_cache["sig"] = None
+        _conf_cache["conf"] = None
     try:
         os.chmod(CONF_PATH, 0o600)
     except Exception:
@@ -248,27 +271,38 @@ def http(method, url, body=None, headers=None, timeout=15):
 
 
 # ---------------------------------------------------------------- 历史
+# 统计结果缓存：/api/stats 每次都要读 1200 行并解析 detail，历史上限 500 条，
+# 但页面每 60 秒轮询一次、一次打开就是好几次请求。库没变就复用。
+_stats_cache = {"key": None, "val": None}
+_stats_lock = threading.Lock()
+
+
+def _hdb():
+    """历史库连接。用 closing() 保证异常路径也会关掉，不留悬挂的文件锁。"""
+    return closing(sqlite3.connect(HIST_PATH, timeout=10))
+
+
 def hist_init():
     os.makedirs(DATA_DIR, exist_ok=True)
-    con = sqlite3.connect(HIST_PATH)
-    con.execute("""create table if not exists checks(
-        id integer primary key autoincrement,
-        ts text, verdict text, summary text, detail text)""")
-    con.commit()
-    con.close()
+    with _hdb() as con:
+        con.execute("""create table if not exists checks(
+            id integer primary key autoincrement,
+            ts text, verdict text, summary text, detail text)""")
+        con.commit()
 
 
 def hist_add(ts, verdict, summary, detail):
     """返回这条记录的 id（状态图按 id 回查 detail 现画）"""
     try:
-        con = sqlite3.connect(HIST_PATH, timeout=10)
-        cur = con.execute("insert into checks(ts,verdict,summary,detail) values(?,?,?,?)",
-                          (ts, verdict, summary, json.dumps(detail, ensure_ascii=False)))
-        rid = cur.lastrowid
-        con.execute("delete from checks where id not in "
-                    "(select id from checks order by id desc limit 500)")
-        con.commit()
-        con.close()
+        with _hdb() as con:
+            cur = con.execute("insert into checks(ts,verdict,summary,detail) "
+                              "values(?,?,?,?)",
+                              (ts, verdict, summary,
+                               json.dumps(detail, ensure_ascii=False)))
+            rid = cur.lastrowid
+            con.execute("delete from checks where id not in "
+                        "(select id from checks order by id desc limit 500)")
+            con.commit()
         return rid
     except Exception:
         return None
@@ -277,9 +311,9 @@ def hist_add(ts, verdict, summary, detail):
 def hist_detail(rid):
     """按 history id 取回当轮 detail（状态图现画用）"""
     try:
-        con = sqlite3.connect(HIST_PATH, timeout=10)
-        row = con.execute("select detail from checks where id=?", (int(rid),)).fetchone()
-        con.close()
+        with _hdb() as con:
+            row = con.execute("select detail from checks where id=?",
+                              (int(rid),)).fetchone()
         return (json.loads(row[0]) or {}) if row else None
     except Exception:
         return None
@@ -287,16 +321,34 @@ def hist_detail(rid):
 
 def hist_list(limit=30):
     try:
-        con = sqlite3.connect(HIST_PATH, timeout=10)
-        rows = con.execute("select id,ts,verdict,summary from checks "
-                           "order by id desc limit ?", (limit,)).fetchall()
-        con.close()
+        with _hdb() as con:
+            rows = con.execute("select id,ts,verdict,summary from checks "
+                               "order by id desc limit ?", (limit,)).fetchall()
         return [{"id": r[0], "ts": r[1], "verdict": r[2], "summary": r[3]} for r in rows]
     except Exception:
         return []
 
 
 def hist_stats(rounds=21, days=30):
+    """带缓存的入口：页面每 60 秒轮询一次 /api/stats，而聚合要读 1200 行
+    并逐条解析 detail JSON。历史库没变就直接复用上次结果，避免白烧 CPU。
+    缓存键用 (mtime, size)：有新巡检落库时文件必然变化，自动失效。"""
+    try:
+        st = os.stat(HIST_PATH)
+        key = (st.st_mtime_ns, st.st_size, rounds, days)
+    except Exception:
+        return _hist_stats_calc(rounds, days)
+    with _stats_lock:
+        if _stats_cache.get("key") == key:
+            return _stats_cache["val"]
+    val = _hist_stats_calc(rounds, days)
+    with _stats_lock:
+        _stats_cache["key"] = key
+        _stats_cache["val"] = val
+    return val
+
+
+def _hist_stats_calc(rounds=21, days=30):
     """聚合历史库：可用率、本周异常、实测通过率、连续在线天数、
     每个网盘近 N 轮的状态条（画热力条用）、持续失效起点。
     rows 按 id 倒序（最新在前）。detail JSON 只解析最近 ~40 条，别的不碰。"""
@@ -304,10 +356,9 @@ def hist_stats(rounds=21, days=30):
              "probe_tot": 0, "streak": 0, "strips": {}, "recent": [],
              "bad_since": {}, "flaky": {}}
     try:
-        con = sqlite3.connect(HIST_PATH, timeout=10)
-        rows = con.execute("select ts,verdict,detail from checks "
-                           "order by id desc limit 1200").fetchall()
-        con.close()
+        with _hdb() as con:
+            rows = con.execute("select ts,verdict,detail from checks "
+                               "order by id desc limit 1200").fetchall()
     except Exception:
         return empty
     if not rows:
@@ -316,15 +367,20 @@ def hist_stats(rounds=21, days=30):
     now = datetime.now(CST)
     cut30 = (now - timedelta(days=days)).strftime("%Y-%m-%d %H:%M:%S")
     cut7 = (now - timedelta(days=7)).strftime("%Y-%m-%d %H:%M:%S")
+    cut14 = (now - timedelta(days=14)).strftime("%Y-%m-%d %H:%M:%S")
 
     in30 = [(ts, v) for ts, v, _ in rows if ts >= cut30]
     total30 = len(in30)
 
     week_bad = len([1 for ts, v in in30 if ts >= cut7 and v != "OK"])
     week_total = len([1 for ts, v in in30 if ts >= cut7])
+    # 上周同期，供统计卡上的趋势对比（「比上周好了还是差了」）
+    week_prev_bad = len([1 for ts, v in in30 if cut14 <= ts < cut7 and v != "OK"])
+    week_prev_total = len([1 for ts, v in in30 if cut14 <= ts < cut7])
 
     # 可用率按「网盘 × 轮次」加权：一个网盘挂了不该把全局打成 0%
-    prov_ok = prov_tot = 0
+    prov_ok = prov_tot = 0          # 30 天
+    prov_ok7 = prov_tot7 = 0        # 近 7 天
     for ts, _v, det in rows:
         if ts < cut30:
             continue
@@ -336,8 +392,13 @@ def hist_stats(rounds=21, days=30):
             if p.get("status") == "off":
                 continue
             prov_tot += 1
-            if p.get("status") == "ok":
+            okp = p.get("status") == "ok"
+            if okp:
                 prov_ok += 1
+            if ts >= cut7:
+                prov_tot7 += 1
+                if okp:
+                    prov_ok7 += 1
 
     # 连续全绿天数：从今天往回数，碰到有 FAIL 的天就停
     bad_days = {ts[:10] for ts, v, _ in rows if v == "FAIL"}
@@ -430,7 +491,9 @@ def hist_stats(rounds=21, days=30):
             flaky[g] = {"fail": fail, "tot": len(ss), "recover": rec}
 
     return {"uptime30": round(prov_ok * 100.0 / prov_tot, 1) if prov_tot else None,
+            "uptime7": round(prov_ok7 * 100.0 / prov_tot7, 1) if prov_tot7 else None,
             "total30": total30, "week_bad": week_bad, "week_total": week_total,
+            "week_prev_bad": week_prev_bad, "week_prev_total": week_prev_total,
             "probe_ok": probe_ok, "probe_tot": probe_tot, "streak": streak,
             "strips": strips, "flaky": flaky,
             "recent": [{"ts": ts, "verdict": v} for ts, v, _ in recent],
@@ -443,10 +506,9 @@ def hist_incidents(days=30, limit=12):
     now = datetime.now(CST)
     cut = (now - timedelta(days=days)).strftime("%Y-%m-%d %H:%M:%S")
     try:
-        con = sqlite3.connect(HIST_PATH, timeout=10)
-        rows = con.execute("select ts,verdict,detail from checks where ts>=? order by id asc",
-                           (cut,)).fetchall()
-        con.close()
+        with _hdb() as con:
+            rows = con.execute("select ts,verdict,detail from checks "
+                               "where ts>=? order by id asc", (cut,)).fetchall()
     except Exception:
         return {"items": [], "total": 0, "days": []}
     if not rows:
@@ -1123,7 +1185,7 @@ def check_once(conf):
     try:
         min_h = float(pr["min_interval_h"])
     except Exception:
-        min_h = 20.0
+        min_h = 8.0          # 与 DEFAULT_CONF 一致；早先回退值写成 20，行为会莫名变长
     try:
         gap_s = float(pr["gap_s"])
     except Exception:
@@ -1432,9 +1494,13 @@ def push_groups(detail):
     low = [p for p in provs
            if p.get("share_total") and (p.get("share_work") or 0) < p.get("share_total")]
     if low:
+        # 「夸克 42/65」这种带数字的条目比较长，超过 4 个就收成「等 N 个」，
+        # 否则一行撑开三四行；只列名字的三个小类不截断（名字短，且少一个就是漏报）。
+        shown = low[:4]
+        tail = "" if len(low) <= 4 else " 等 %d 个" % len(low)
         net.append("分享：" + "、".join(
             "%s %s/%s" % (p.get("group"), p.get("share_work"), p.get("share_total"))
-            for p in low[:3]))
+            for p in shown) + tail)
     else:
         net.append("分享：全部可用")
 
@@ -1444,11 +1510,12 @@ def push_groups(detail):
     probed = [p for p in provs if p.get("probe") in ("ok", "bad", "unknown")]
     pbad = [p for p in probed if p.get("probe") == "bad"]
     punk = [p for p in probed if p.get("probe") == "unknown"]
+    # 这里一律全列：标题已按全部坏盘生成，正文少一个就变成「标题说有、正文没有」。
     if pbad:
-        net.append("实测：%s 未通过" % "、".join(p.get("group") or "?" for p in pbad[:3]))
+        net.append("实测：%s 未通过" % "、".join(p.get("group") or "?" for p in pbad))
     if punk:
         net.append("实测未定：%s（字段待确认）" % "、".join(
-            p.get("group") or "?" for p in punk[:3]))
+            p.get("group") or "?" for p in punk))
     if not pbad and not punk and probed:
         net.append("实测：%d 个通过" % len(probed))
     if not probed:
@@ -1459,7 +1526,10 @@ def push_groups(detail):
     xym = d.get("xyemd") or {}
     if xym:
         pct = xym.get("pct")
-        if pct is not None:
+        # 空转时 0/0 会被算成 100%，写「成功率 100%」是误导，改说实情
+        if xym.get("idle"):
+            sync.append("空转：连续 %s 天零下载零清理" % xym.get("idle"))
+        elif pct is not None:
             sync.append("成功率：%.1f%%（失败 %s 个）" % (pct, xym.get("fail") or 0))
         else:
             sync.append("成功率：" + (xym.get("msg") or "读不出"))
@@ -1678,10 +1748,9 @@ def _today_rounds(now=None):
     """当天已跑几轮、几轮正常、几轮异常（含本轮，hist_add 已先写）"""
     today = (now or datetime.now(CST)).strftime("%Y-%m-%d")
     try:
-        con = sqlite3.connect(HIST_PATH, timeout=10)
-        rows = con.execute("select verdict from checks where ts like ?",
-                           (today + "%",)).fetchall()
-        con.close()
+        with _hdb() as con:
+            rows = con.execute("select verdict from checks where ts like ?",
+                               (today + "%",)).fetchall()
     except Exception:
         return None
     tot = len(rows)
@@ -1947,7 +2016,16 @@ def start_run(conf, push=True):
                 STATE["running"] = False
                 STATE["phase"] = ""
 
-    threading.Thread(target=job, daemon=True).start()
+    try:
+        threading.Thread(target=job, daemon=True).start()
+    except Exception as e:
+        # 线程起不来（内存/句柄耗尽）时必须回滚 running，
+        # 否则页面会永远停在「正在检测」，按钮也一直禁用
+        with _state_lock:
+            STATE["running"] = False
+            STATE["phase"] = ""
+        log("巡检线程启动失败：", e)
+        return False
     return True
 
 
@@ -2138,6 +2216,9 @@ button.go:disabled{opacity:.6;cursor:default;transform:none}
 background:rgba(239,68,68,.1);color:var(--bad);border:1px solid rgba(239,68,68,.22)}
 .err.on{display:block;animation:shake .35s}
 @keyframes shake{0%,100%{transform:translateX(0)}25%{transform:translateX(-5px)}75%{transform:translateX(5px)}}
+.chk{display:flex;align-items:center;gap:8px;margin-top:14px;font-size:0.7812rem;
+color:var(--txt2);cursor:pointer;user-select:none}
+.chk input{width:16px;height:16px;padding:0;flex:none;accent-color:var(--brand);cursor:pointer}
 .foot{margin-top:22px;text-align:center;font-size:0.7188rem;color:var(--txt3);letter-spacing:0.017em}
 </style></head><body>
 <form class="box" onsubmit="return go(event)">
@@ -2154,6 +2235,7 @@ background:rgba(239,68,68,.1);color:var(--bad);border:1px solid rgba(239,68,68,.
         <circle cx="12" cy="12" r="3"/></svg>
     </button>
   </div>
+  <label class="chk"><input type="checkbox" id="rem"> 记住我 30 天（这台设备免登录）</label>
   <button class="go" id="btn" type="submit">进入</button>
   <div class="err" id="err"></div>
   <div class="foot">Netwatch · 每日自动巡检</div>
@@ -2167,9 +2249,11 @@ async function go(e){
   e.preventDefault();
   var pw=document.getElementById('pw').value;
   if(!pw){show('请输入密码');return false}
+  var rem=document.getElementById('rem');
   var b=document.getElementById('btn'); b.disabled=true; b.textContent='验证中…';
   try{
-    var r=await fetch('/api/login',{method:'POST',body:JSON.stringify({password:pw})});
+    var r=await fetch('/api/login',{method:'POST',
+      body:JSON.stringify({password:pw,remember:!!(rem&&rem.checked)})});
     var d=await r.json();
     if(d.ok){location.replace('/');return false}
     show(d.msg||'密码不正确');
@@ -2528,7 +2612,9 @@ th,td{text-align:left;padding:9px 10px;border-bottom:1px solid var(--line2)}
 th{color:var(--txt3);font-weight:500;font-size:0.7188rem;letter-spacing:0.026em;text-transform:uppercase}
 tr:last-child td{border-bottom:0}
 tbody tr:hover{background:var(--surf2)}
-.td-sum{color:var(--txt2);max-width:520px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+/* 摘要以前用 nowrap + 省略号，窄屏上几乎什么也看不到；改成最多两行 */
+.td-sum{color:var(--txt2);max-width:520px;overflow:hidden;white-space:normal;
+display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;line-height:1.5}
 /* 数字列右对齐 + 等宽数字，几行扫下去位数对得齐 */
 th.num,td.num{text-align:right;font-variant-numeric:tabular-nums}
 /* 个人盘不止一个时（阿里云盘的资源盘 + 备份盘），数字下面加虚线提示可悬停 */
@@ -2545,6 +2631,19 @@ box-shadow:0 12px 28px -12px rgba(0,0,0,.7);max-width:90vw;text-align:center}
 #toast.on{opacity:1;transform:translate(-50%,0)}
 .foot-note{text-align:center;color:var(--txt3);font-size:0.7188rem;margin-top:26px}
 .foot-note a{text-decoration:none}
+
+/* 回到顶部：页面很长（首页概览 + 设置 + 历史），滚两屏后浮出 */
+#toTop{position:fixed;right:18px;bottom:22px;z-index:70;width:40px;height:40px;
+border-radius:50%;display:grid;place-items:center;cursor:pointer;
+border:1px solid var(--line);background:color-mix(in srgb,var(--surf) 84%,transparent);
+backdrop-filter:blur(14px) saturate(160%);-webkit-backdrop-filter:blur(14px) saturate(160%);
+color:var(--txt2);box-shadow:0 10px 24px -14px rgba(16,24,40,.5);
+opacity:0;pointer-events:none;transform:translateY(8px);
+transition:opacity .22s ease,transform .22s ease,color .16s}
+#toTop.on{opacity:1;pointer-events:auto;transform:none}
+#toTop:hover{color:var(--txt)}
+#toTop:active{transform:scale(.94)}
+@media(max-width:560px){#toTop{right:12px;bottom:76px}}
 
 /* ---------- 网盘徽标 ---------- */
 .pvb{width:22px;height:22px;flex:none;display:block;
@@ -3051,6 +3150,12 @@ th:nth-child(3),td:nth-child(3){min-width:180px}
 </div>
 
 <div id="toast"></div>
+<button id="toTop" onclick="window.scrollTo({top:0,behavior:'smooth'})" aria-label="回到顶部"
+  title="回到顶部">
+  <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+    stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M12 19V5M5 12l7-7 7 7"/></svg>
+</button>
 <div id="savebar"><span class="dot"></span><span class="t" id="sbTxt">有改动还没保存</span>
   <button class="btn pri sm" id="sbSave" onclick="save(this)" title="快捷键 ⌘S / Ctrl+S，一次保存全部改动">全部保存</button>
   <button class="btn ghost sm" id="sbDrop" onclick="reloadConf()">放弃</button>
@@ -3245,7 +3350,8 @@ window.addEventListener('beforeunload',function(e){
 function switchTab(n){
   document.querySelectorAll('.tab').forEach(function(e){e.classList.toggle('on',e.dataset.t===n)});
   document.querySelectorAll('.panel').forEach(function(e){e.classList.toggle('on',e.id==='p-'+n)});
-  try{history.replaceState(null,'','?tab='+n)}catch(e){}
+  // 用 hash 记住当前页：刷新后还停在这一页，链接也能直接分享
+  try{history.replaceState(null,'','#'+n)}catch(e){}
 }
 
 /* ---------- 倒计时 ---------- */
@@ -3386,8 +3492,11 @@ function renderHero(r){
   else if((r.xyemd && r.xyemd.ok===false)||(r.emby && r.emby.ok===false)||
           (r.play && r.play.ok===false)){
     hero.classList.add('s-bad'); pulse.className='pulse bad';
+    // 「空转」是任务跑完了但没有新东西，和「没跑成」是两回事，不能混着说
     txt.textContent=(r.play && r.play.ok===false)?'播放链路打不开'
-      :((r.xyemd && r.xyemd.ok===false)?'每日同步没跑成':'影音库断更'); }
+      :((r.xyemd && r.xyemd.ok===false)
+        ? (r.xyemd.idle?('同步连续 '+r.xyemd.idle+' 天没有新内容'):'每日同步没跑成')
+        : '影音库断更'); }
   else if(last.verdict==='OK'){ pulse.className='pulse';
     txt.textContent=(provs.length||'全部')+' 个网盘全部正常'; }
   else { pulse.className='pulse warn'; txt.textContent='结果：'+last.verdict; }
@@ -3421,8 +3530,12 @@ function heroSum(r,provs,bad,warn){
   if(warn) return '有网盘的分享目录全部失效，但个人盘正常——多为上游取消分享，不一定要改凭证。';
   if(r.play && r.play.ok===false)
     return '播放链路实探没通：随便挑了一集取播放地址失败了。先看各网盘卡片是不是全红——全红就是凭证问题。';
-  if(r.xyemd && r.xyemd.ok===false)
+  if(r.xyemd && r.xyemd.ok===false){
+    if(r.xyemd.idle)
+      return '同步任务照常跑完了，但已连续 '+r.xyemd.idle+' 天没有任何新增（0 下载、0 清理）。'+
+        '上游刚好没更新属正常；若一直在更新，就去看 xy-emd 的源列表是不是空了。';
     return '每日同步这次没跑成：'+(r.xyemd.msg||'看日志')+'。xy-emd 容器本身在跑吗？';
+  }
   if(r.xyemd && r.xyemd.missing_eps)
     return '每日同步已完成，'+(r.xyemd.pct!=null?(r.xyemd.pct.toFixed(1)+'%、'):'')+
       '有 '+r.xyemd.missing_eps+' 集没下来（多因上游分享返回 403），不影响已入库的内容播放。';
@@ -3544,7 +3657,10 @@ function renderEmby(sy, em, ply){
   }
 
   // ① 文件级真实成功率（xy-emd 自报的 100% 不算数，见后端注释）
-  if(sy && sy.pct!=null){
+  //    空转时 100% 是个假象（0/0 也算 100%），直接写「空转 N 天」更诚实
+  if(sy && sy.idle){
+    cells.push(cell('每日同步', '空转 '+sy.idle+' 天', 'bad', '0 下载 · 0 清理'));
+  }else if(sy && sy.pct!=null){
     var tot=(sy.dl||0)+(sy.fail||0);
     cells.push(cell('每日同步', sy.pct.toFixed(1)+'%', syncBad?'bad':'ok',
       (sy.dl||0)+' / '+tot+' 个文件'));
@@ -3650,9 +3766,13 @@ function renderStats(st){
     $('sUp').textContent='–'; $('sWeek').textContent='–';
     $('sProbe').textContent='–'; $('sStreak').textContent='–'; return;
   }
+  // 主数字后面再带一句同期对比：光看「1 轮异常」判断不了是在变好还是变坏
   $('sUp').innerHTML=(st.uptime30==null?'–':st.uptime30+'<small>%</small>')+
-    (st.total30?'<small> · '+st.total30+' 轮</small>':'');
-  $('sWeek').innerHTML=st.week_bad+(st.week_total?'<small> / '+st.week_total+' 轮</small>':'<small> 轮</small>');
+    (st.uptime7!=null?'<small> · 近7天 '+st.uptime7+'%</small>':
+      (st.total30?'<small> · '+st.total30+' 轮</small>':''));
+  $('sWeek').innerHTML=st.week_bad+
+    (st.week_total?'<small> / '+st.week_total+' 轮</small>':'<small> 轮</small>')+
+    (st.week_prev_total?'<small> · 上周 '+st.week_prev_bad+'</small>':'');
   $('sProbe').textContent=st.probe_tot?(st.probe_ok+' / '+st.probe_tot):'–';
   $('sStreak').innerHTML=st.streak+'<small> 天</small>';
 }
@@ -4108,11 +4228,14 @@ async function showHist(id){
 function closeModal(){ $('modal').classList.remove('on') }
 document.addEventListener('keydown',function(e){ if(e.key==='Escape') closeModal() });
 
-/* 吸顶栏：只在内容真的滚到下面时才浮出边缘 */
+/* 吸顶栏：只在内容真的滚到下面时才浮出边缘；顺带控制「回到顶部」 */
 (function(){
-  var hd=document.querySelector('.hd');
-  if(!hd) return;
-  function onScroll(){ hd.classList.toggle('scrolled', window.scrollY > 4) }
+  var hd=document.querySelector('.hd'), tt=document.getElementById('toTop');
+  function onScroll(){
+    var y=window.scrollY||document.documentElement.scrollTop||0;
+    if(hd) hd.classList.toggle('scrolled', y>4);
+    if(tt) tt.classList.toggle('on', y>480);
+  }
   window.addEventListener('scroll',onScroll,{passive:true});
   onScroll();
 })();
@@ -4123,7 +4246,10 @@ async function logout(){
 }
 
 (function(){
-  var m=location.search.match(/[?&]tab=(notify|src|conn)/);
+  // 先认 hash（刷新保留），再兼容老链接里的 ?tab=
+  var h=(location.hash||'').replace(/^#/,'');
+  var m=/^(notify|src|conn)$/.test(h)?[null,h]
+    :location.search.match(/[?&]tab=(notify|src|conn)/);
   if(m) switchTab(m[1]);
 })();
 load(); setInterval(function(){ if(!S.dirty) load() },60000);
@@ -4133,6 +4259,7 @@ load(); setInterval(function(){ if(!S.dirty) load() },60000);
 # ---------------------------------------------------------------- 服务
 SESSION_COOKIE = "aw_sess"
 SESSION_DAYS = 7
+SESSION_DAYS_LONG = 30        # 勾了「记住我」用长有效期，自家 NAS 少被踢出去
 
 
 def _sess_sig(pw, exp):
@@ -4141,9 +4268,36 @@ def _sess_sig(pw, exp):
     return hmac.new(key, msg, hashlib.sha256).hexdigest()[:32]
 
 
-def make_session(pw):
-    exp = int(time.time()) + SESSION_DAYS * 86400
+def make_session(pw, days=None):
+    exp = int(time.time()) + int(days or SESSION_DAYS) * 86400
     return "%d.%s" % (exp, _sess_sig(pw, exp))
+
+
+# 登录失败限速：单 IP 1 分钟内失误 6 次就暂时拒答。
+# 公网暴露时这能挡掉最简单的字典爆破；自家局域网也不会有任何感知。
+_login_fails = {}
+_login_lock = threading.Lock()
+
+
+def _login_blocked(ip):
+    now = time.time()
+    with _login_lock:
+        arr = [t for t in (_login_fails.get(ip) or []) if now - t < 60]
+        if arr:
+            _login_fails[ip] = arr
+        else:
+            _login_fails.pop(ip, None)
+        return len(arr) >= 6
+
+
+def _login_fail(ip):
+    with _login_lock:
+        _login_fails.setdefault(ip, []).append(time.time())
+
+
+def _login_clear(ip):
+    with _login_lock:
+        _login_fails.pop(ip, None)
 
 
 def session_ok(pw, val):
@@ -4289,35 +4443,27 @@ class Handler(BaseHTTPRequestHandler):
             detail_play = None
             detail_xyemd = None
             push_groups_data = None
-            if not last:
-                # 容器刚重启时内存里还没有结果，先用历史最后一轮顶上，
-                # 否则页面会短暂显示「首次检测」+ 全 0，看着像数据丢了
-                try:
-                    con = sqlite3.connect(HIST_PATH, timeout=10)
-                    row = con.execute("select ts,verdict,summary from checks "
+            # 一次查询把「最新一轮」的摘要和明细都取出来：
+            # 之前分两次连接各查一遍，同一行读两回，白多一次 IO。
+            try:
+                with _hdb() as con:
+                    row = con.execute("select ts,verdict,summary,detail from checks "
                                       "order by id desc limit 1").fetchone()
-                    con.close()
-                    if row:
+                if row:
+                    if not last:
+                        # 容器刚重启时内存里还没有结果，先用历史最后一轮顶上，
+                        # 否则页面会短暂显示「首次检测」+ 全 0，看着像数据丢了
                         last = {"ts": row[0], "verdict": row[1],
                                 "lines": [row[2] or ""], "push": "", "cat": row[0][:10]}
-                except Exception:
-                    pass
-            if last:
-                try:
-                    con = sqlite3.connect(HIST_PATH, timeout=10)
-                    row = con.execute("select detail from checks order by id desc limit 1"
-                                      ).fetchone()
-                    con.close()
-                    if row:
-                        _d = json.loads(row[0]) or {}
-                        detail_providers = _d.get("providers", [])
-                        skipped_groups = _d.get("skipped_groups", [])
-                        detail_emby = _d.get("emby")
-                        detail_play = _d.get("play")
-                        detail_xyemd = _d.get("xyemd")
-                        push_groups_data = push_groups(_d)
-                except Exception:
-                    pass
+                    _d = json.loads(row[3] or "{}") or {}
+                    detail_providers = _d.get("providers", [])
+                    skipped_groups = _d.get("skipped_groups", [])
+                    detail_emby = _d.get("emby")
+                    detail_play = _d.get("play")
+                    detail_xyemd = _d.get("xyemd")
+                    push_groups_data = push_groups(_d)
+            except Exception:
+                pass
             try:
                 nr = next_run(conf)
                 nxt = nr.strftime("%m-%d %H:%M")
@@ -4355,10 +4501,9 @@ class Handler(BaseHTTPRequestHandler):
             except Exception:
                 return self._send(400, {"error": "bad id"})
             try:
-                con = sqlite3.connect(HIST_PATH, timeout=10)
-                row = con.execute("select ts,verdict,summary,detail from checks where id=?",
-                                  (hid,)).fetchone()
-                con.close()
+                with _hdb() as con:
+                    row = con.execute("select ts,verdict,summary,detail from checks "
+                                      "where id=?", (hid,)).fetchone()
             except Exception as e:
                 return self._send(500, {"error": str(e)})
             if not row:
@@ -4378,12 +4523,20 @@ class Handler(BaseHTTPRequestHandler):
         except Exception:
             body = {}
         if path == "/api/login":
+            ip = self.client_address[0]
+            if _login_blocked(ip):
+                return self._send(429, {"ok": False,
+                                        "msg": "尝试次数过多，请 1 分钟后再试"})
             pw = conf.get("ui_password") or ""
             got = str(body.get("password") or "")
             if not pw or hmac.compare_digest(got, pw):
+                _login_clear(ip)
+                days = SESSION_DAYS_LONG if body.get("remember") else SESSION_DAYS
                 ck = "%s=%s; Path=/; HttpOnly; SameSite=Lax; Max-Age=%d" % (
-                    SESSION_COOKIE, make_session(pw), SESSION_DAYS * 86400)
-                return self._send(200, {"ok": True}, headers={"Set-Cookie": ck})
+                    SESSION_COOKIE, make_session(pw, days), days * 86400)
+                return self._send(200, {"ok": True, "days": days},
+                                  headers={"Set-Cookie": ck})
+            _login_fail(ip)
             time.sleep(0.7)
             return self._send(200, {"ok": False, "msg": "密码不正确"})
         if path == "/api/logout":
